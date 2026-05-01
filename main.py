@@ -8,16 +8,48 @@
   - python main.py weekly        : 매주 월요일 주간 리포트
 """
 import sys
+# 출력 즉시 flush 강제 설정 (GitHub Actions 로그 실시간 표시)
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+print("=" * 60, flush=True)
+print("🎬 한고은 채널 분석 시스템 시작", flush=True)
+print("=" * 60, flush=True)
+
 import time
 import traceback
 from datetime import datetime, timedelta
 
+print("⏳ 모듈 import 중...", flush=True)
 import config
+print("  ✓ config", flush=True)
 import youtube_collector as yt
+print("  ✓ youtube_collector", flush=True)
 import gemini_analyzer as gemini
+print("  ✓ gemini_analyzer", flush=True)
 import deepseek_processor as ds
+print("  ✓ deepseek_processor", flush=True)
 import sheets_writer as sheets
+print("  ✓ sheets_writer", flush=True)
 import telegram_notifier as tg
+print("  ✓ telegram_notifier", flush=True)
+
+# 환경변수 체크
+print("\n⏳ 환경변수 체크 중...", flush=True)
+required_vars = {
+    'YOUTUBE_API_KEY': config.YOUTUBE_API_KEY,
+    'GEMINI_API_KEY': config.GEMINI_API_KEY,
+    'DEEPSEEK_API_KEY': config.DEEPSEEK_API_KEY,
+    'TELEGRAM_BOT_TOKEN': config.TELEGRAM_BOT_TOKEN,
+    'TELEGRAM_CHAT_ID': config.TELEGRAM_CHAT_ID,
+    'GOOGLE_WEBHOOK_URL': config.GOOGLE_WEBHOOK_URL,
+}
+missing = [k for k, v in required_vars.items() if not v]
+if missing:
+    print(f"❌ 누락된 환경변수: {missing}", flush=True)
+    sys.exit(1)
+else:
+    print("  ✓ 모든 환경변수 정상", flush=True)
 
 
 def collect_and_analyze_channel(channel_name, months_back=6):
