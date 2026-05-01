@@ -3,7 +3,28 @@ YouTube Data API를 이용해 영상 정보를 수집하는 모듈
 """
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta, timezone
+import re
 import config
+
+
+# ===== 영상 길이 필터 =====
+MIN_VIDEO_DURATION_SECONDS = 300  # 5분 (300초) 이상만 분석
+
+
+def parse_duration(duration_str):
+    """ISO 8601 duration 문자열을 초 단위로 변환
+    예: PT1H2M30S → 3750초, PT45S → 45초
+    """
+    if not duration_str:
+        return 0
+    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration_str)
+    if not match:
+        return 0
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
 
 def get_youtube_client():
     """YouTube API 클라이언트 생성"""
@@ -92,9 +113,10 @@ def get_channel_videos(channel_id, months_back=6):
 
 
 def get_video_details(video_ids):
-    """영상 상세 정보 일괄 조회 (50개씩)"""
+    """영상 상세 정보 일괄 조회 (50개씩) + 5분 이상 영상만 필터"""
     youtube = get_youtube_client()
     all_details = []
+    filtered_count = 0
     
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i+50]
@@ -107,6 +129,13 @@ def get_video_details(video_ids):
             stats = item.get('statistics', {})
             snippet = item.get('snippet', {})
             content = item.get('contentDetails', {})
+            duration_str = content.get('duration', '')
+            duration_seconds = parse_duration(duration_str)
+            
+            # 5분 미만 영상은 제외 (숏폼/짧은 클립)
+            if duration_seconds < MIN_VIDEO_DURATION_SECONDS:
+                filtered_count += 1
+                continue
             
             all_details.append({
                 'video_id': item['id'],
@@ -118,10 +147,14 @@ def get_video_details(video_ids):
                 'view_count': int(stats.get('viewCount', 0)),
                 'like_count': int(stats.get('likeCount', 0)),
                 'comment_count': int(stats.get('commentCount', 0)),
-                'duration': content.get('duration', ''),
+                'duration': duration_str,
+                'duration_seconds': duration_seconds,
                 'thumbnail_url': snippet.get('thumbnails', {}).get('high', {}).get('url', ''),
                 'video_url': f"https://youtube.com/watch?v={item['id']}"
             })
+    
+    if filtered_count > 0:
+        print(f"  📏 5분 미만 영상 {filtered_count}개 제외됨")
     
     return all_details
 
