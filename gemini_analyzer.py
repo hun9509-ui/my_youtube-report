@@ -7,7 +7,7 @@ import json
 import time
 import config
 
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 
 def _ensure_configured():
@@ -101,8 +101,8 @@ def analyze_video(video_data, retry=3):
     return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
 
 
-def analyze_videos_batch(videos, delay=4.5):
-    """여러 영상 배치 분석 (분당 15회 제한 고려)"""
+def analyze_videos_batch(videos, delay=6):
+    """여러 영상 배치 분석 (분당 10회 제한 고려)"""
     results = []
     for i, video in enumerate(videos):
         print(f"  분석 중 ({i+1}/{len(videos)}): {video.get('title', '')[:40]}")
