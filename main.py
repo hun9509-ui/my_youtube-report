@@ -110,7 +110,7 @@ def run_initial_collection():
     
     # Gemini 분석 (배치)
     print(f"\n🤖 Gemini 영상 분석 시작...")
-    gemini_results = gemini.analyze_videos_batch(all_videos[:100], delay=4.5)
+    gemini_results = gemini.analyze_videos_batch(all_videos[:100], delay=6)
     
     # 댓글 분석 (상위 영상만)
     print(f"\n💬 댓글 분석 시작 (상위 30개 영상)")
@@ -189,7 +189,7 @@ def run_daily_collection():
         stats['new_videos'] = new_count
         
         # 분석
-        gemini_results = gemini.analyze_videos_batch(all_new_videos, delay=4.5)
+        gemini_results = gemini.analyze_videos_batch(all_new_videos, delay=6)
         analyses = []
         
         for video in all_new_videos:
