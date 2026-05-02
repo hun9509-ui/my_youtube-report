@@ -1,4 +1,4 @@
-name: 일일 영상 수집 및 분석
+name: 일일 영상 수집 및 분석x
 
 on:
   schedule:
