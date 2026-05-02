@@ -184,3 +184,51 @@ def get_videos_from_sheet(days_back=7):
     if result and 'videos' in result:
         return result['videos']
     return []
+
+def save_trend_classified(classified: dict) -> int:
+    """트렌드 분류 결과를 시트에 저장 (트랙 A/B/이레귤러 통합)"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    rows = []
+ 
+    def _to_row(v, track):
+        return [
+            today, track, v.get('video_id', ''),
+            v.get('title', ''), v.get('channel_title', ''),
+            v.get('view_count', 0), v.get('like_count', 0),
+            v.get('comment_count', 0), v.get('published_at', ''),
+            v.get('track_score_a', 0), v.get('track_score_b', 0),
+            ', '.join(v.get('matched_keywords', [])) if isinstance(v.get('matched_keywords'), list) else '',
+            ', '.join(v.get('irregular_reasons', [])) if isinstance(v.get('irregular_reasons'), list) else '',
+            f"https://www.youtube.com/watch?v={v.get('video_id', '')}",
+        ]
+ 
+    for v in classified.get('track_a', []):
+        rows.append(_to_row(v, 'A'))
+    for v in classified.get('track_b', []):
+        rows.append(_to_row(v, 'B'))
+    for v in classified.get('irregular', []):
+        rows.append(_to_row(v, 'IRREGULAR'))
+ 
+    if not rows:
+        return 0
+ 
+    result = call_webhook('save_trends_v2', {
+        'sheet_name': config.SHEET_TRENDS,
+        'rows': rows,
+        'headers': ['날짜', '트랙', '영상ID', '제목', '채널명',
+                    '조회수', '좋아요', '댓글수', '업로드일',
+                    '트랙A점수', '트랙B점수', '매칭키워드', '이레귤러사유', 'URL']
+    })
+ 
+    # 사건 키워드는 별도 시트에 저장 (선택)
+    event_kws = classified.get('event_keywords', [])
+    if event_kws:
+        call_webhook('save_event_keywords', {
+            'sheet_name': '일일_사건키워드',
+            'rows': [[today, ', '.join(event_kws)]],
+            'headers': ['날짜', '사건키워드']
+        })
+ 
+    return len(rows)
+ 
+ 
