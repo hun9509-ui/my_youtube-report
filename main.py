@@ -67,9 +67,20 @@ def collect_channel(channel_name: str, months_back: int = 6) -> list[dict]:
         return []
 
     print(f"✅ 채널 ID: {channel_id}")
-    videos = yt.get_channel_videos(channel_id, months_back=months_back)
-    print(f"📹 영상 수집: {len(videos)}개 (숏폼 제외)")
-    return videos
+    
+    # 1. 포장지 분해: 영상 목록(raw_videos)과 채널 정보(channel_info)를 따로 받기
+    raw_videos, channel_info = yt.get_channel_videos(channel_id, months_back=months_back)
+    
+    if not raw_videos:
+        print("📹 수집된 기본 영상 없음")
+        return []
+        
+    # 2. 영상 ID만 추출해서 '조회수, 길이' 등 상세 정보 가져오기
+    video_ids = [v['video_id'] for v in raw_videos]
+    detailed_videos = yt.get_video_details(video_ids)
+    
+    print(f"📹 영상 수집: {len(detailed_videos)}개 (숏폼/5분 미만 제외)")
+    return detailed_videos
 
 
 def analyze_video_complete(video: dict, gemini_result: dict) -> dict:
