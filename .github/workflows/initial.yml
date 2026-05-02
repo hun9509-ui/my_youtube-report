@@ -1,29 +1,28 @@
-name: 초기 데이터 수집 (수동 실행)
+name: 초기 배치 수집
 
-# 자동 실행 안 함 - 수동으로만 1회 실행
 on:
   workflow_dispatch:
+    inputs:
+      batch_num:
+        description: '배치 번호 (1~5)'
+        required: true
+        default: '1'
+        type: choice
+        options: ['1', '2', '3', '4', '5']
 
 jobs:
-  initial-collection:
+  initial-batch:
     runs-on: ubuntu-latest
-    timeout-minutes: 240  # 4시간 (대량 처리)
-    
+    timeout-minutes: 90
     steps:
-      - name: 코드 체크아웃
-        uses: actions/checkout@v4
-      
-      - name: Python 설정
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: 의존성 설치
-        run: |
+      - run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-      
-      - name: 초기 수집 실행
+      - name: 배치 수집 실행
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -32,4 +31,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_WEBHOOK_URL: ${{ secrets.GOOGLE_WEBHOOK_URL }}
-        run: python -u main.py initial
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -u main.py initial-batch ${{ github.event.inputs.batch_num }}
