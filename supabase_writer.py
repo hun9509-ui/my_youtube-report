@@ -185,3 +185,108 @@ def save_channel_insights(channel_insights):
     except Exception as e:
         print(f"  ⚠️ Supabase channel_insights 저장 실패: {e}")
         return 0
+
+def save_trend_classified(classified: dict) -> int:
+    """트렌드 분류 결과를 Supabase에 저장"""
+    client = get_client()
+    if not client:
+        return 0
+ 
+    today = datetime.now().date().isoformat()
+    rows = []
+ 
+    def _to_row(v, track):
+        return {
+            'analysis_date': today,
+            'track': track,
+            'video_id': v.get('video_id', ''),
+            'title': v.get('title', ''),
+            'channel_title': v.get('channel_title', ''),
+            'view_count': v.get('view_count', 0),
+            'like_count': v.get('like_count', 0),
+            'comment_count': v.get('comment_count', 0),
+            'published_at': v.get('published_at'),
+            'track_score_a': v.get('track_score_a', 0),
+            'track_score_b': v.get('track_score_b', 0),
+            'matched_keywords': v.get('matched_keywords', []),
+            'irregular_reasons': v.get('irregular_reasons', []),
+            'irregular_metrics': v.get('irregular_metrics', {}),
+        }
+ 
+    for v in classified.get('track_a', []):
+        rows.append(_to_row(v, 'A'))
+    for v in classified.get('track_b', []):
+        rows.append(_to_row(v, 'B'))
+    for v in classified.get('irregular', []):
+        rows.append(_to_row(v, 'IRREGULAR'))
+ 
+    if not rows:
+        return 0
+ 
+    try:
+        client.table('trend_classified').insert(rows).execute()
+ 
+        # 사건 키워드 별도 저장
+        event_kws = classified.get('event_keywords', [])
+        if event_kws:
+            client.table('event_keywords').insert({
+                'analysis_date': today,
+                'keywords': event_kws,
+            }).execute()
+ 
+        print(f"  💾 Supabase: trend_classified {len(rows)}개 저장")
+        return len(rows)
+    except Exception as e:
+        print(f"  ⚠️ Supabase trend_classified 저장 실패: {e}")
+        return 0
+ 
+ 
+def get_weekly_trend_summary(days_back: int = 7) -> dict:
+    """지난 N일간 트렌드 데이터 종합 (월요일 알림용)"""
+    client = get_client()
+    if not client:
+        return {}
+ 
+    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+ 
+    try:
+        # 트랙별 TOP 영상 (조회수 순)
+        track_a = client.table('trend_classified') \
+            .select('*') \
+            .eq('track', 'A') \
+            .gte('analysis_date', cutoff) \
+            .order('view_count', desc=True) \
+            .limit(10) \
+            .execute()
+ 
+        track_b = client.table('trend_classified') \
+            .select('*') \
+            .eq('track', 'B') \
+            .gte('analysis_date', cutoff) \
+            .order('view_count', desc=True) \
+            .limit(10) \
+            .execute()
+ 
+        # 이번 주 사건 키워드 빈도 합산
+        kw_data = client.table('event_keywords') \
+            .select('keywords') \
+            .gte('analysis_date', cutoff) \
+            .execute()
+ 
+        from collections import Counter
+        kw_counter = Counter()
+        for row in kw_data.data:
+            for k in row.get('keywords', []):
+                kw_counter[k] += 1
+ 
+        top_keywords = [k for k, _ in kw_counter.most_common(10)]
+ 
+        return {
+            'track_a': track_a.data,
+            'track_b': track_b.data,
+            'event_keywords': top_keywords,
+            'period_days': days_back,
+        }
+    except Exception as e:
+        print(f"  ⚠️ 주간 트렌드 조회 실패: {e}")
+        return {}
