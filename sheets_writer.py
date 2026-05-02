@@ -1,6 +1,5 @@
 """
-구글 시트에 데이터를 저장하는 모듈 (Apps Script 웹훅 방식)
-서비스 계정 JSON 불필요 - 조직 정책 무관
+구글 시트 저장 모듈 (Apps Script 웹훅)
 """
 import requests
 import json
@@ -9,13 +8,10 @@ import config
 
 
 def call_webhook(action, data):
-    """Apps Script 웹훅 호출"""
     if not config.GOOGLE_WEBHOOK_URL:
         print("⚠️ GOOGLE_WEBHOOK_URL이 설정되지 않음")
         return None
-    
     payload = {"action": action, "data": data}
-    
     try:
         response = requests.post(config.GOOGLE_WEBHOOK_URL, json=payload, timeout=120)
         if response.status_code == 200:
@@ -37,11 +33,10 @@ def save_videos(videos):
             today, v.get('channel_title', ''), v.get('video_id', ''),
             v.get('title', ''), v.get('published_at', ''),
             v.get('view_count', 0), v.get('like_count', 0), v.get('comment_count', 0),
-            v.get('duration', ''), v.get('tags', ''),
+            v.get('duration', ''), str(v.get('tags', '')),
             v.get('thumbnail_url', ''), v.get('video_url', ''),
             v.get('description', '')[:200]
         ])
-    
     result = call_webhook('save_videos', {
         'sheet_name': config.SHEET_VIDEOS,
         'rows': rows,
@@ -52,35 +47,60 @@ def save_videos(videos):
     return result.get('saved_count', 0) if result else 0
 
 
-def save_analysis(analyses):
-    """AI 분석 결과 저장"""
+def _build_analysis_row(a, extra_first_cols):
+    """분석 결과 1행 생성 (초기/일일 공통)"""
+    gemini = a.get('gemini', {}) or {}
+    comments = a.get('comments', {}) or {}
+    sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
+    
+    return extra_first_cols + [
+        a.get('video_id', ''),
+        gemini.get('topic', ''),
+        gemini.get('category', ''),
+        gemini.get('title_pattern', ''),
+        ', '.join(gemini.get('title_keywords', [])) if isinstance(gemini.get('title_keywords'), list) else '',
+        gemini.get('hook_strategy', ''),
+        str(gemini.get('ppl_likely', '')),
+        gemini.get('ppl_signals', ''),
+        gemini.get('target_audience', ''),
+        gemini.get('performance_level', ''),
+        gemini.get('success_factors', ''),
+        gemini.get('applicability', ''),
+        gemini.get('applicability_reason', ''),
+        sentiment.get('positive', ''),
+        sentiment.get('negative', ''),
+        ', '.join(comments.get('main_keywords', [])) if isinstance(comments.get('main_keywords'), list) else '',
+        comments.get('viewer_persona', '') if isinstance(comments, dict) else '',
+        ', '.join(comments.get('praise_points', [])) if isinstance(comments.get('praise_points'), list) else '',
+        ', '.join(comments.get('complaints', [])) if isinstance(comments.get('complaints'), list) else '',
+        comments.get('summary', '') if isinstance(comments, dict) else ''
+    ]
+
+
+def save_initial_analysis(analyses, batch_num):
+    """초기 분석 결과 저장 (배치별)"""
     today = datetime.now().strftime('%Y-%m-%d')
-    rows = []
-    for a in analyses:
-        gemini = a.get('gemini', {})
-        comments = a.get('comments', {})
-        sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
-        
-        rows.append([
-            today, a.get('video_id', ''),
-            gemini.get('topic', ''), gemini.get('category', ''),
-            gemini.get('title_pattern', ''),
-            ', '.join(gemini.get('title_keywords', [])) if isinstance(gemini.get('title_keywords'), list) else '',
-            gemini.get('hook_strategy', ''),
-            str(gemini.get('ppl_likely', '')), gemini.get('ppl_signals', ''),
-            gemini.get('target_audience', ''), gemini.get('performance_level', ''),
-            gemini.get('success_factors', ''),
-            gemini.get('applicability', ''), gemini.get('applicability_reason', ''),
-            sentiment.get('positive', ''), sentiment.get('negative', ''),
-            ', '.join(comments.get('main_keywords', [])) if isinstance(comments.get('main_keywords'), list) else '',
-            comments.get('viewer_persona', '') if isinstance(comments, dict) else '',
-            ', '.join(comments.get('praise_points', [])) if isinstance(comments.get('praise_points'), list) else '',
-            ', '.join(comments.get('complaints', [])) if isinstance(comments.get('complaints'), list) else '',
-            comments.get('summary', '') if isinstance(comments, dict) else ''
-        ])
+    rows = [_build_analysis_row(a, [today, batch_num]) for a in analyses]
     
     result = call_webhook('save_analysis', {
-        'sheet_name': config.SHEET_ANALYSIS,
+        'sheet_name': config.SHEET_INITIAL,
+        'rows': rows,
+        'headers': ['분석일', '배치번호', '영상ID', '주제', '카테고리', '제목패턴', '핵심키워드',
+                    '후킹전략', 'PPL여부', 'PPL근거', '타겟층', '성과수준', '성공요인',
+                    '한고은적용가능성', '적용근거',
+                    '여론_긍정', '여론_부정', '여론_핵심키워드', '시청자페르소나',
+                    '칭찬포인트', '불만사항', '댓글요약']
+    })
+    return result.get('saved_count', 0) if result else 0
+
+
+def save_daily_analysis(analyses):
+    """일일 분석 결과 저장 (날짜별)"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    rows = [_build_analysis_row(a, [today]) for a in analyses]
+    
+    result = call_webhook('save_analysis', {
+        'sheet_name': config.SHEET_DAILY,
         'rows': rows,
         'headers': ['분석일', '영상ID', '주제', '카테고리', '제목패턴', '핵심키워드',
                     '후킹전략', 'PPL여부', 'PPL근거', '타겟층', '성과수준', '성공요인',
@@ -91,8 +111,12 @@ def save_analysis(analyses):
     return result.get('saved_count', 0) if result else 0
 
 
+# 기존 호환성: save_analysis는 daily로 매핑
+def save_analysis(analyses):
+    return save_daily_analysis(analyses)
+
+
 def save_channel_insights(channel_insights):
-    """채널별 성공 공식 저장"""
     today = datetime.now().strftime('%Y-%m-%d')
     rows = []
     for channel, insights in channel_insights.items():
@@ -106,7 +130,6 @@ def save_channel_insights(channel_insights):
             insights.get('differentiator', ''),
             ', '.join(insights.get('lessons_for_hangoeun', [])) if isinstance(insights.get('lessons_for_hangoeun'), list) else ''
         ])
-    
     result = call_webhook('save_insights', {
         'sheet_name': config.SHEET_CHANNEL_INSIGHTS,
         'rows': rows,
@@ -117,7 +140,6 @@ def save_channel_insights(channel_insights):
 
 
 def save_daily_trends(trends_data):
-    """일일 트렌드 저장"""
     today = datetime.now().strftime('%Y-%m-%d')
     row = [
         today, trends_data.get('headline', ''),
@@ -134,7 +156,6 @@ def save_daily_trends(trends_data):
 
 
 def save_weekly_report(report):
-    """주간 리포트 저장"""
     today = datetime.now().strftime('%Y-%m-%d')
     row = [
         today, report.get('week_summary', ''),
@@ -155,7 +176,6 @@ def save_weekly_report(report):
 
 
 def get_videos_from_sheet(days_back=7):
-    """시트에서 최근 N일 영상 조회 (주간 리포트용)"""
     cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
     result = call_webhook('get_recent_videos', {
         'sheet_name': config.SHEET_VIDEOS,
