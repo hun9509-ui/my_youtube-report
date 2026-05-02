@@ -140,3 +140,75 @@ def send_error_alert(error_msg, context=""):
 GitHub Actions 로그를 확인해주세요.
 """
     return send_message(message.strip())
+
+def send_irregular_alert(video: dict):
+    """이레귤러 영상 즉시 알림"""
+    reasons = video.get('irregular_reasons', [])
+    metrics = video.get('irregular_metrics', {})
+    matched = video.get('matched_keywords', [])
+ 
+    msg = (
+        f"⚡ <b>이레귤러 감지!</b>\n\n"
+        f"📺 <b>{video.get('title', '')}</b>\n"
+        f"📻 채널: {video.get('channel_title', '')}\n\n"
+        f"📊 <b>지표</b>\n"
+    )
+ 
+    for r in reasons:
+        msg += f"  • {r}\n"
+ 
+    if metrics:
+        msg += (
+            f"\n⏰ 업로드 후: {metrics.get('hours_since_upload', 0):.1f}시간\n"
+            f"👁 총 조회수: {metrics.get('view_count', 0):,}\n"
+            f"📈 시간당: {metrics.get('views_per_hour', 0):,}회\n"
+        )
+ 
+    if matched:
+        msg += f"\n🏷 키워드: {', '.join(matched[:5])}\n"
+ 
+    msg += f"\n🔗 https://www.youtube.com/watch?v={video.get('video_id', '')}"
+ 
+    send_message(msg)
+ 
+ 
+def send_weekly_trend_alert(weekly_data: dict):
+    """월요일 주간 트렌드 종합 알림 (트랙 A + 트랙 B 투트랙)"""
+    track_a = weekly_data.get('track_a', [])
+    track_b = weekly_data.get('track_b', [])
+    event_kws = weekly_data.get('event_keywords', [])
+    days = weekly_data.get('period_days', 7)
+ 
+    msg = f"📊 <b>주간 트렌드 분석</b> (지난 {days}일)\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+ 
+    # 사건 키워드
+    if event_kws:
+        msg += "🔑 <b>이번 주 핵심 키워드</b>\n"
+        msg += " ".join([f"#{k}" for k in event_kws[:8]])
+        msg += "\n\n"
+ 
+    # 트랙 A
+    msg += "🌸 <b>트랙 A | 30~60대 여성</b>\n"
+    if track_a:
+        for i, v in enumerate(track_a[:5], 1):
+            title = v.get('title', '')[:35]
+            views = v.get('view_count', 0)
+            msg += f"  {i}. [{v.get('channel_title','')}] {title}\n"
+            msg += f"     조회수 {views:,}회\n"
+    else:
+        msg += "  (해당 영상 없음)\n"
+    msg += "\n"
+ 
+    # 트랙 B
+    msg += "🔥 <b>트랙 B | 10~30대 트렌드</b>\n"
+    if track_b:
+        for i, v in enumerate(track_b[:5], 1):
+            title = v.get('title', '')[:35]
+            views = v.get('view_count', 0)
+            msg += f"  {i}. [{v.get('channel_title','')}] {title}\n"
+            msg += f"     조회수 {views:,}회\n"
+    else:
+        msg += "  (해당 영상 없음)\n"
+ 
+    send_message(msg)
