@@ -3,7 +3,7 @@ Supabase 이중 저장 모듈
 시트와 동일한 데이터를 PostgreSQL DB에도 저장
 """
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, timedelta
 import config
 
 

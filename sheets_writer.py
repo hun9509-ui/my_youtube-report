@@ -224,7 +224,7 @@ def save_trend_classified(classified: dict) -> int:
     event_kws = classified.get('event_keywords', [])
     if event_kws:
         call_webhook('save_event_keywords', {
-            'sheet_name': '일일_사건키워드',
+            'sheet_name': config.SHEET_EVENT_KEYWORDS,
             'rows': [[today, ', '.join(event_kws)]],
             'headers': ['날짜', '사건키워드']
         })

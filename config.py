@@ -62,6 +62,7 @@ SHEET_INITIAL = "초기_분석결과"          # 신규
 SHEET_DAILY = "일일_분석결과"            # 신규
 SHEET_CHANNEL_INSIGHTS = "채널별_성공공식"
 SHEET_TRENDS = "일일_트렌드"
+SHEET_EVENT_KEYWORDS = "일일_사건키워드"
 SHEET_WEEKLY = "주간_리포트"
 
 # 기존 호환성 유지
