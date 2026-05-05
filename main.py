@@ -179,7 +179,7 @@ def run_initial_batch(batch_num: int):
     sheets.save_videos(all_videos)
     db.save_videos(all_videos)
 
-    print(f"\n🤖 Gemini 분석 ({len(all_videos)}개) - gemini-2.5-pro")
+    print(f"\n🤖 Gemini 분석 ({len(all_videos)}개)")
     gemini_results = gemini.analyze_videos_batch(all_videos, delay=5, model_mode='initial')
 
     print(f"\n💬 댓글/DeepSeek 분석")
