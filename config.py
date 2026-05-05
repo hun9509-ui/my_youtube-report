@@ -19,7 +19,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ===== Google Cloud (Vertex AI) =====
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "totemic-courage-495009-h4")
-GOOGLE_CLOUD_LOCATION = "us-east4"
+GOOGLE_CLOUD_LOCATION = "us-central1"
 
 # ===== 분석 대상 채널 =====
 TARGET_CHANNELS = {
@@ -55,11 +55,9 @@ TRENDING_VIDEOS_COUNT = 50
 # ===== Gemini 모델 =====
 def get_gemini_model(mode='daily'):
     """mode: 'initial' | 'daily' | 'free'"""
-    if mode == 'initial':
-        return "gemini-3.1-flash-lite"
     if mode == 'free':
-        return "gemini-2.0-flash"
-    return "gemini-3.1-flash-lite"
+        return "gemini-2.0-flash-001"
+    return "gemini-2.5-flash"
 
 # ===== 대박 영상 기준 =====
 HIT_VIDEO_MULTIPLIER = 2.0  # 채널 평균 조회수 × 2배 이상
