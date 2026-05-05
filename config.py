@@ -17,6 +17,10 @@ GOOGLE_WEBHOOK_URL = os.getenv("GOOGLE_WEBHOOK_URL")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# ===== Google Cloud (Vertex AI) =====
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "totemic-courage-495009-h4")
+GOOGLE_CLOUD_LOCATION = "us-central1"
+
 # ===== 분석 대상 채널 =====
 TARGET_CHANNELS = {
     "안녕하세요 최화정이에요": "UCIQQC0T_yj-pXoXRk5vaOAw",

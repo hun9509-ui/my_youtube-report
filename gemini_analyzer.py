@@ -1,26 +1,32 @@
 """
-Gemini API를 이용한 영상 분석 모듈
+Vertex AI를 이용한 영상 분석 모듈 (Gemini 3.1 Flash Lite)
 """
-import google.generativeai as genai
+import vertexai
+from vertexai.generative_models import GenerativeModel
 import json
 import re
 import time
 import config
 
+_initialized = False
+
 
 def _ensure_configured():
-    if config.GEMINI_API_KEY:
-        genai.configure(api_key=config.GEMINI_API_KEY)
+    global _initialized
+    if not _initialized:
+        vertexai.init(
+            project=config.GOOGLE_CLOUD_PROJECT,
+            location=config.GOOGLE_CLOUD_LOCATION
+        )
+        _initialized = True
 
 
 def _extract_json(text: str) -> dict:
-    """Gemini 응답에서 JSON 추출 (형식 무관하게 robust하게 처리)"""
+    """응답에서 JSON 추출 (형식 무관 robust 처리)"""
     text = text.strip()
-    # ```json ... ``` 또는 ``` ... ``` 블록 처리
     block = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
     if block:
         text = block.group(1).strip()
-    # 중괄호 블록 추출 (앞뒤 설명 텍스트 제거)
     obj = re.search(r'\{[\s\S]*\}', text)
     if obj:
         return json.loads(obj.group())
@@ -69,7 +75,7 @@ def analyze_video(video_data, model_name=None, retry=3):
     _ensure_configured()
     if model_name is None:
         model_name = config.get_gemini_model('daily')
-    model = genai.GenerativeModel(model_name)
+    model = GenerativeModel(model_name)
 
     prompt = ANALYSIS_PROMPT.format(
         title=video_data.get('title', ''),
@@ -102,7 +108,7 @@ def analyze_video(video_data, model_name=None, retry=3):
             }
         except Exception as e:
             err = str(e)
-            if "quota" in err.lower() or "rate" in err.lower():
+            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted", "resourceexhausted"]):
                 print(f"  ⚠️ Rate limit (시도 {attempt+1}), 60초 대기...")
                 time.sleep(60)
                 continue
@@ -115,7 +121,7 @@ def analyze_video(video_data, model_name=None, retry=3):
 def analyze_videos_batch(videos, delay=5, model_mode='daily'):
     """여러 영상 배치 분석"""
     model_name = config.get_gemini_model(model_mode)
-    print(f"  🤖 Gemini 모델: {model_name}")
+    print(f"  🤖 Gemini 모델: {model_name} (Vertex AI)")
     results = []
     errors = 0
 
@@ -137,7 +143,7 @@ def analyze_videos_batch(videos, delay=5, model_mode='daily'):
 def detect_daily_trends(trending_videos):
     """일일 트렌드 영상에서 패턴 감지"""
     _ensure_configured()
-    model = genai.GenerativeModel(config.get_gemini_model('daily'))
+    model = GenerativeModel(config.get_gemini_model('daily'))
 
     videos_summary = "\n".join([
         f"- [{v['view_count']:,}회] {v['title']} ({v['channel_title']})"
