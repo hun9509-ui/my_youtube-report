@@ -19,7 +19,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ===== Google Cloud (Vertex AI) =====
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "totemic-courage-495009-h4")
-GOOGLE_CLOUD_LOCATION = "us-central1"
+GOOGLE_CLOUD_LOCATION = "us-east4"
 
 # ===== 분석 대상 채널 =====
 TARGET_CHANNELS = {
