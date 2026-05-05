@@ -1,19 +1,31 @@
 """
 Gemini API를 이용한 영상 분석 모듈
-영상 메타데이터 + 썸네일을 분석해 인사이트 추출
 """
 import google.generativeai as genai
 import json
+import re
 import time
 import config
 
-MODEL_NAME = "gemini-2.5-flash-lite"
-
 
 def _ensure_configured():
-    """Gemini API 키 설정 (호출 시점에)"""
     if config.GEMINI_API_KEY:
         genai.configure(api_key=config.GEMINI_API_KEY)
+
+
+def _extract_json(text: str) -> dict:
+    """Gemini 응답에서 JSON 추출 (형식 무관하게 robust하게 처리)"""
+    text = text.strip()
+    # ```json ... ``` 또는 ``` ... ``` 블록 처리
+    block = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
+    if block:
+        text = block.group(1).strip()
+    # 중괄호 블록 추출 (앞뒤 설명 텍스트 제거)
+    obj = re.search(r'\{[\s\S]*\}', text)
+    if obj:
+        return json.loads(obj.group())
+    return json.loads(text)
+
 
 ANALYSIS_PROMPT = """
 당신은 유튜브 콘텐츠 분석 전문가입니다.
@@ -32,27 +44,33 @@ ANALYSIS_PROMPT = """
 {{
   "topic": "영상의 핵심 주제 (1줄)",
   "category": "라이프스타일/뷰티/요리/육아/패션/여행/일상/기타 중 하나",
-  "title_pattern": "제목의 패턴 (질문형/단정형/숫자형/감정형/정보형 중)",
+  "title_pattern": "질문형/단정형/숫자형/감정형/정보형 중 하나",
   "title_keywords": ["핵심 키워드 3개"],
-  "hook_strategy": "시청자를 끌어들이는 후킹 전략",
-  "ppl_likely": true/false,
-  "ppl_signals": "PPL 가능성 근거 (있을 시)",
-  "target_audience": "주 타겟 시청자층",
-  "performance_level": "대박/평작/저조 중 (조회수와 채널 규모 고려)",
-  "success_factors": "성공/실패 추정 요인 (1-2줄)",
-  "applicability": "한고은 채널(60대 살림/라이프) 적용 가능성 (상/중/하)",
-  "applicability_reason": "적용 가능성 이유"
+  "title_emotion_tone": "따뜻함/놀람/친근함/권위감/유머/공감/기대감 중 하나",
+  "hook_strategy": "시청자를 끌어들이는 후킹 전략 (구체적으로)",
+  "content_structure": "브이로그형/정보전달형/스토리텔링형/리뷰형/토크형 중 하나",
+  "ppl_likely": true,
+  "ppl_signals": "PPL 가능성 근거 (없으면 빈 문자열)",
+  "target_audience": "주 타겟 시청자층 (연령/성별/관심사 포함)",
+  "performance_level": "대박/평작/저조 중 하나 (조회수와 채널 규모 고려)",
+  "success_factors": "이 영상의 성공/실패 추정 요인 (구체적으로 2-3줄)",
+  "unique_differentiator": "같은 채널 다른 영상 대비 이 영상만이 가진 특별한 점 (없으면 없음)",
+  "applicability": "한고은 채널(60대 살림/라이프, 담백·진정성) 적용 가능성 (상/중/하)",
+  "applicability_reason": "적용 가능성 이유 (1줄)",
+  "hangoeun_scenario": "한고은 채널이라면 이 영상을 어떻게 만들지 - 제목 방향성, 구성, 핵심 메시지를 포함해 구체적으로 2-3줄"
 }}
 
-JSON만 반환하고 다른 설명은 하지 마세요.
+반드시 JSON만 반환하세요. 다른 설명은 절대 하지 마세요.
 """
 
 
-def analyze_video(video_data, retry=3):
+def analyze_video(video_data, model_name=None, retry=3):
     """단일 영상 분석"""
     _ensure_configured()
-    model = genai.GenerativeModel(MODEL_NAME)
-    
+    if model_name is None:
+        model_name = config.get_gemini_model('daily')
+    model = genai.GenerativeModel(model_name)
+
     prompt = ANALYSIS_PROMPT.format(
         title=video_data.get('title', ''),
         channel=video_data.get('channel_title', ''),
@@ -63,68 +81,69 @@ def analyze_video(video_data, retry=3):
         comments=video_data.get('comment_count', 0),
         duration=video_data.get('duration', '')
     )
-    
+
     for attempt in range(retry):
         try:
             response = model.generate_content(prompt)
-            text = response.text.strip()
-            
-            # JSON 추출
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-            
-            result = json.loads(text)
+            result = _extract_json(response.text)
             result['video_id'] = video_data.get('video_id', '')
             return result
-            
-        except json.JSONDecodeError:
+
+        except json.JSONDecodeError as e:
+            raw = response.text[:300] if 'response' in dir() else ''
+            print(f"  ⚠️ JSON 파싱 실패 (시도 {attempt+1}): {e} | 응답: {raw}")
             if attempt < retry - 1:
                 time.sleep(2)
                 continue
             return {
                 'video_id': video_data.get('video_id', ''),
-                'error': 'JSON 파싱 실패',
-                'raw_response': text[:200] if 'text' in dir() else ''
+                'error': f'JSON 파싱 실패: {e}',
+                'raw_response': raw
             }
         except Exception as e:
-            if "quota" in str(e).lower() or "rate" in str(e).lower():
-                time.sleep(60)  # Rate limit 시 1분 대기
+            err = str(e)
+            if "quota" in err.lower() or "rate" in err.lower():
+                print(f"  ⚠️ Rate limit (시도 {attempt+1}), 60초 대기...")
+                time.sleep(60)
                 continue
-            return {
-                'video_id': video_data.get('video_id', ''),
-                'error': str(e)
-            }
-    
+            print(f"  ❌ Gemini 오류: {err}")
+            return {'video_id': video_data.get('video_id', ''), 'error': err}
+
     return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
 
 
-def analyze_videos_batch(videos, delay=6):
-    """여러 영상 배치 분석 (분당 10회 제한 고려)"""
+def analyze_videos_batch(videos, delay=5, model_mode='daily'):
+    """여러 영상 배치 분석"""
+    model_name = config.get_gemini_model(model_mode)
+    print(f"  🤖 Gemini 모델: {model_name}")
     results = []
+    errors = 0
+
     for i, video in enumerate(videos):
-        print(f"  분석 중 ({i+1}/{len(videos)}): {video.get('title', '')[:40]}")
-        result = analyze_video(video)
+        print(f"  분석 중 ({i+1}/{len(videos)}): {video.get('title', '')[:45]}")
+        result = analyze_video(video, model_name=model_name)
+        if 'error' in result:
+            errors += 1
+            print(f"    ❌ 실패: {result['error']}")
         results.append(result)
-        
+
         if i < len(videos) - 1:
-            time.sleep(delay)  # Rate limit 방지
-    
+            time.sleep(delay)
+
+    print(f"  ✅ Gemini 완료: 성공 {len(results)-errors}개 / 실패 {errors}개")
     return results
 
 
 def detect_daily_trends(trending_videos):
     """일일 트렌드 영상에서 패턴 감지"""
     _ensure_configured()
-    model = genai.GenerativeModel(MODEL_NAME)
-    
+    model = genai.GenerativeModel(config.get_gemini_model('daily'))
+
     videos_summary = "\n".join([
         f"- [{v['view_count']:,}회] {v['title']} ({v['channel_title']})"
         for v in trending_videos[:30]
     ])
-    
+
     prompt = f"""
 오늘 한국 유튜브 인기 영상 TOP 30입니다.
 이 데이터에서 트렌드 패턴을 분석해주세요.
@@ -144,15 +163,9 @@ def detect_daily_trends(trending_videos):
 
 JSON만 반환하세요.
 """
-    
+
     try:
         response = model.generate_content(prompt)
-        text = response.text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        return json.loads(text)
+        return _extract_json(response.text)
     except Exception as e:
         return {'error': str(e)}

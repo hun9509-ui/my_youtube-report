@@ -134,6 +134,10 @@ def run_initial_batch(batch_num: int):
     channels = config.INITIAL_BATCHES[batch_num]
     print(f"📋 대상 채널: {channels}")
 
+    # 재실행 시 기존 데이터 삭제
+    print(f"🗑️ 기존 배치#{batch_num} 데이터 초기화 중...")
+    db.delete_initial_batch(batch_num)
+
     all_videos: list[dict] = []
     channel_videos_map: dict[str, list[dict]] = {}
 
@@ -153,14 +157,35 @@ def run_initial_batch(batch_num: int):
         tg.send_message(f"⚠️ 배치#{batch_num}: 분석할 영상 없음")
         return
 
+    # 채널별 평균 조회수 계산 → 대박 영상 태그
+    channel_avg: dict[str, float] = {}
+    for name, vids in channel_videos_map.items():
+        if vids:
+            avg = sum(v.get('view_count', 0) for v in vids) / len(vids)
+            channel_avg[name] = avg
+            yt_title = vids[0].get('channel_title', '')
+            if yt_title:
+                channel_avg[yt_title] = avg
+            print(f"  📊 {name} 평균 조회수: {int(avg):,}회")
+
+    hit_count = 0
+    for v in all_videos:
+        avg = channel_avg.get(v.get('channel_title', ''), 0)
+        v['channel_avg_views'] = int(avg)
+        v['is_hit'] = avg > 0 and v.get('view_count', 0) >= avg * config.HIT_VIDEO_MULTIPLIER
+        if v['is_hit']:
+            hit_count += 1
+    print(f"  ⭐ 대박 영상 (평균 ×{config.HIT_VIDEO_MULTIPLIER}): {hit_count}개")
+
     sheets.save_videos(all_videos)
     db.save_videos(all_videos)
 
-    print(f"\n🤖 Gemini 분석 ({len(all_videos)}개)")
-    gemini_results = gemini.analyze_videos_batch(all_videos, delay=5)
+    print(f"\n🤖 Gemini 분석 ({len(all_videos)}개) - gemini-2.5-pro")
+    gemini_results = gemini.analyze_videos_batch(all_videos, delay=5, model_mode='initial')
 
     print(f"\n💬 댓글/DeepSeek 분석")
     buffer: list[dict] = []
+    all_analyses: list[dict] = []
     total_saved = 0
 
     for i, video in enumerate(all_videos):
@@ -168,8 +193,12 @@ def run_initial_batch(batch_num: int):
             (g for g in gemini_results if g.get("video_id") == video["video_id"]),
             {"error": "Gemini 매칭 실패"}
         )
-        buffer.append(analyze_video_complete(video, g_result))
-        print(f"  [{i+1}/{len(all_videos)}] {video.get('title','')[:45]}")
+        analysis = analyze_video_complete(video, g_result)
+        analysis['is_hit'] = video.get('is_hit', False)
+        analysis['channel_avg_views'] = video.get('channel_avg_views', 0)
+        buffer.append(analysis)
+        all_analyses.append(analysis)
+        print(f"  [{i+1}/{len(all_videos)}] {'⭐' if video.get('is_hit') else '  '} {video.get('title','')[:45]}")
 
         if len(buffer) >= 10:
             _save_analyses(buffer, "initial", batch_num)
@@ -182,6 +211,21 @@ def run_initial_batch(batch_num: int):
         total_saved += len(buffer)
 
     print(f"\n✅ 분석 저장 완료: {total_saved}개")
+
+    # 대박 영상 심층 분석
+    hit_videos = [v for v in all_videos if v.get('is_hit')]
+    if hit_videos:
+        print(f"\n⭐ 대박 영상 심층 분석 ({len(hit_videos)}개)")
+        for video in hit_videos:
+            try:
+                g_result = next((g for g in gemini_results if g.get('video_id') == video['video_id']), {})
+                a_result = next((a for a in all_analyses if a.get('video_id') == video['video_id']), {})
+                hit_analysis = ds.analyze_hit_video(video, g_result, a_result.get('comments', {}))
+                db.save_hit_analysis(video['video_id'], hit_analysis)
+                print(f"  ⭐ [{video.get('view_count',0):,}회] {video.get('title','')[:45]}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"  ⚠️ hit_analysis 실패 ({video.get('video_id','')}): {e}")
 
     print(f"\n🎯 채널별 성공공식 분석")
     insights: dict[str, dict] = {}
@@ -203,6 +247,7 @@ def run_initial_batch(batch_num: int):
         f"✅ <b>배치#{batch_num} 완료</b>\n\n"
         f"📺 채널: {', '.join(channels)}\n"
         f"🎬 영상: {len(all_videos)}개\n"
+        f"⭐ 대박: {hit_count}개\n"
         f"💾 저장: {total_saved}개\n"
         f"⏱️ 소요: {duration/60:.1f}분"
     )
@@ -246,7 +291,7 @@ def run_daily_collection():
     stats["new"] = len(all_new)
 
     print(f"\n🤖 Gemini 분석 ({len(all_new)}개)")
-    gemini_results = gemini.analyze_videos_batch(all_new, delay=5)
+    gemini_results = gemini.analyze_videos_batch(all_new, delay=5, model_mode='daily')
 
     analyses: list[dict] = []
     for video in all_new:

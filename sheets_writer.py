@@ -52,44 +52,60 @@ def _build_analysis_row(a, extra_first_cols):
     gemini = a.get('gemini', {}) or {}
     comments = a.get('comments', {}) or {}
     sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
-    
+
     return extra_first_cols + [
         a.get('video_id', ''),
         gemini.get('topic', ''),
         gemini.get('category', ''),
         gemini.get('title_pattern', ''),
         ', '.join(gemini.get('title_keywords', [])) if isinstance(gemini.get('title_keywords'), list) else '',
+        gemini.get('title_emotion_tone', ''),
         gemini.get('hook_strategy', ''),
+        gemini.get('content_structure', ''),
         str(gemini.get('ppl_likely', '')),
         gemini.get('ppl_signals', ''),
         gemini.get('target_audience', ''),
         gemini.get('performance_level', ''),
         gemini.get('success_factors', ''),
+        gemini.get('unique_differentiator', ''),
         gemini.get('applicability', ''),
         gemini.get('applicability_reason', ''),
+        gemini.get('hangoeun_scenario', ''),
         sentiment.get('positive', ''),
         sentiment.get('negative', ''),
         ', '.join(comments.get('main_keywords', [])) if isinstance(comments.get('main_keywords'), list) else '',
         comments.get('viewer_persona', '') if isinstance(comments, dict) else '',
         ', '.join(comments.get('praise_points', [])) if isinstance(comments.get('praise_points'), list) else '',
         ', '.join(comments.get('complaints', [])) if isinstance(comments.get('complaints'), list) else '',
-        comments.get('summary', '') if isinstance(comments, dict) else ''
+        comments.get('this_video_special', '') if isinstance(comments, dict) else '',
+        comments.get('revisit_intent', '') if isinstance(comments, dict) else '',
+        comments.get('viral_signals', '') if isinstance(comments, dict) else '',
+        comments.get('summary', '') if isinstance(comments, dict) else '',
     ]
+
+
+_ANALYSIS_HEADERS_BASE = [
+    '영상ID', '주제', '카테고리', '제목패턴', '핵심키워드', '제목감정톤',
+    '후킹전략', '콘텐츠구조', 'PPL여부', 'PPL근거', '타겟층', '성과수준', '성공요인',
+    '차별화포인트', '한고은적용가능성', '적용근거', '한고은시나리오',
+    '여론_긍정', '여론_부정', '여론_핵심키워드', '시청자페르소나',
+    '칭찬포인트', '불만사항', '이영상만의이유', '재방문의사%', '바이럴시그널', '댓글요약',
+]
 
 
 def save_initial_analysis(analyses, batch_num):
     """초기 분석 결과 저장 (배치별)"""
     today = datetime.now().strftime('%Y-%m-%d')
-    rows = [_build_analysis_row(a, [today, batch_num]) for a in analyses]
-    
-    result = call_webhook('save_analysis', {
+    rows = []
+    for a in analyses:
+        row = _build_analysis_row(a, [today, batch_num])
+        row.append('대박' if a.get('is_hit') else '')
+        rows.append(row)
+
+    result = call_webhook('save_initial', {
         'sheet_name': config.SHEET_INITIAL,
         'rows': rows,
-        'headers': ['분석일', '배치번호', '영상ID', '주제', '카테고리', '제목패턴', '핵심키워드',
-                    '후킹전략', 'PPL여부', 'PPL근거', '타겟층', '성과수준', '성공요인',
-                    '한고은적용가능성', '적용근거',
-                    '여론_긍정', '여론_부정', '여론_핵심키워드', '시청자페르소나',
-                    '칭찬포인트', '불만사항', '댓글요약']
+        'headers': ['분석일', '배치번호'] + _ANALYSIS_HEADERS_BASE + ['대박여부'],
     })
     return result.get('saved_count', 0) if result else 0
 
@@ -98,15 +114,11 @@ def save_daily_analysis(analyses):
     """일일 분석 결과 저장 (날짜별)"""
     today = datetime.now().strftime('%Y-%m-%d')
     rows = [_build_analysis_row(a, [today]) for a in analyses]
-    
-    result = call_webhook('save_analysis', {
+
+    result = call_webhook('save_daily', {
         'sheet_name': config.SHEET_DAILY,
         'rows': rows,
-        'headers': ['분석일', '영상ID', '주제', '카테고리', '제목패턴', '핵심키워드',
-                    '후킹전략', 'PPL여부', 'PPL근거', '타겟층', '성과수준', '성공요인',
-                    '한고은적용가능성', '적용근거',
-                    '여론_긍정', '여론_부정', '여론_핵심키워드', '시청자페르소나',
-                    '칭찬포인트', '불만사항', '댓글요약']
+        'headers': ['분석일'] + _ANALYSIS_HEADERS_BASE,
     })
     return result.get('saved_count', 0) if result else 0
 

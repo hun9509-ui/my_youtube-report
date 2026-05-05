@@ -48,6 +48,18 @@ INITIAL_MONTHS = 6
 TOP_COMMENTS_COUNT = 200
 TRENDING_VIDEOS_COUNT = 50
 
+# ===== Gemini 모델 =====
+def get_gemini_model(mode='daily'):
+    """mode: 'initial' (Pro) | 'daily' (Flash) | 'free' (무료티어)"""
+    if mode == 'initial':
+        return "gemini-2.5-pro"
+    if mode == 'free':
+        return "gemini-2.0-flash"
+    return "gemini-2.5-flash"
+
+# ===== 대박 영상 기준 =====
+HIT_VIDEO_MULTIPLIER = 2.0  # 채널 평균 조회수 × 2배 이상
+
 # ===== DeepSeek 모델 =====
 DEEPSEEK_DISCOUNT_END = datetime(2026, 5, 31, 23, 59)
 

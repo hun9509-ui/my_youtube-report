@@ -52,20 +52,47 @@ def save_videos(videos):
         return 0
 
 
+def delete_initial_batch(batch_num):
+    """배치 재실행 전 기존 데이터 삭제"""
+    client = get_client()
+    if not client:
+        return
+    try:
+        client.table('initial_analysis').delete().eq('batch_num', batch_num).execute()
+        print(f"  🗑️ Supabase: 배치#{batch_num} 기존 데이터 삭제 완료")
+    except Exception as e:
+        print(f"  ⚠️ 배치 데이터 삭제 실패: {e}")
+
+
+def save_hit_analysis(video_id, hit_analysis):
+    """대박 영상 심층 분석 결과 업데이트"""
+    client = get_client()
+    if not client:
+        return
+    try:
+        client.table('initial_analysis')\
+            .update({'hit_analysis': hit_analysis, 'is_hit': True})\
+            .eq('video_id', video_id)\
+            .execute()
+        print(f"  ⭐ Supabase: hit_analysis 저장 ({video_id[:8]}...)")
+    except Exception as e:
+        print(f"  ⚠️ hit_analysis 저장 실패: {e}")
+
+
 def save_initial_analysis(analyses, batch_num):
     """초기 분석 결과 저장"""
     client = get_client()
     if not client:
         return 0
-    
+
     today = datetime.now().date().isoformat()
     rows = []
-    
+
     for a in analyses:
         gemini = a.get('gemini', {}) or {}
         comments = a.get('comments', {}) or {}
         sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
-        
+
         rows.append({
             'analysis_date': today,
             'batch_num': batch_num,
@@ -91,10 +118,12 @@ def save_initial_analysis(analyses, batch_num):
             'comments_summary': comments.get('summary', ''),
             'gemini_raw': gemini,
             'deepseek_raw': comments,
+            'is_hit': a.get('is_hit', False),
+            'channel_avg_views': a.get('channel_avg_views', 0),
         })
-    
+
     try:
-        result = client.table('initial_analysis').insert(rows).execute()
+        client.table('initial_analysis').insert(rows).execute()
         print(f"  💾 Supabase: initial_analysis {len(rows)}개 저장")
         return len(rows)
     except Exception as e:
