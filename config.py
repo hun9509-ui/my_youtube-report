@@ -50,12 +50,12 @@ TRENDING_VIDEOS_COUNT = 50
 
 # ===== Gemini 모델 =====
 def get_gemini_model(mode='daily'):
-    """mode: 'initial' (Pro) | 'daily' (Flash) | 'free' (무료티어)"""
+    """mode: 'initial' | 'daily' | 'free'"""
     if mode == 'initial':
-        return "gemini-2.5-pro"
+        return "gemini-3.1-flash-lite-preview"
     if mode == 'free':
         return "gemini-2.0-flash"
-    return "gemini-2.5-flash"
+    return "gemini-3.1-flash-lite-preview"
 
 # ===== 대박 영상 기준 =====
 HIT_VIDEO_MULTIPLIER = 2.0  # 채널 평균 조회수 × 2배 이상
