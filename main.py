@@ -34,7 +34,6 @@ import trend_classifier as tc;  print("  ✓ trend_classifier", flush=True)
 print("\n⏳ 환경변수 체크 중...", flush=True)
 required = {
     'YOUTUBE_API_KEY':    config.YOUTUBE_API_KEY,
-    'GEMINI_API_KEY':     config.GEMINI_API_KEY,
     'DEEPSEEK_API_KEY':   config.DEEPSEEK_API_KEY,
     'TELEGRAM_BOT_TOKEN': config.TELEGRAM_BOT_TOKEN,
     'TELEGRAM_CHAT_ID':   config.TELEGRAM_CHAT_ID,
