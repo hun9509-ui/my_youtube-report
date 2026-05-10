@@ -2,7 +2,7 @@ name: 주간 리포트
 
 on:
   schedule:
-    - cron: '0 1 * * 1'    # 매주 월요일 KST 10:00
+    - cron: '0 15 * * 0'   # 매주 월요일 KST 00:00
   workflow_dispatch:
 
 jobs:
