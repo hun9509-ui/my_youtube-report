@@ -482,6 +482,36 @@ def run_own_channel_daily():
 # 모드 6: 자체 채널 주간 추적 (매주 월요일)
 # ───────────────────────────────────────────────
 
+def run_own_channel_backfill():
+    """Supabase에 저장된 자체 채널 분석 결과 → 구글 시트 재저장"""
+    print(f"📦 자체 채널 백필 시작")
+    analyses = db.get_all_own_analyses()
+    if not analyses:
+        print("❌ Supabase에 데이터 없음")
+        return
+
+    print(f"📋 {len(analyses)}개 발견")
+    for a in analyses:
+        v = a.get('own_channel_videos') or {}
+        video = {
+            'video_id':     a.get('video_id', ''),
+            'title':        v.get('title', ''),
+            'published_at': str(v.get('published_at', '')),
+            'video_type':   v.get('video_type', 'longform'),
+            'view_count':   v.get('view_count', 0),
+            'like_count':   v.get('like_count', 0),
+            'comment_count':v.get('comment_count', 0),
+            'duration':     v.get('duration', ''),
+            'video_url':    v.get('video_url', ''),
+        }
+        gemini   = a.get('gemini_raw') or {}
+        comments = a.get('deepseek_raw') or {}
+        sheets.save_own_analysis(video, gemini, comments)
+        print(f"  ✅ {video['title'][:45]}")
+
+    print(f"✅ 백필 완료: {len(analyses)}개 → 구글 시트")
+
+
 def run_own_channel_track():
     """매주 월요일 - 업로드 후 5주까지 스냅샷 추적"""
     print(f"📊 자체 채널 추적 시작 ({datetime.now()})")
@@ -627,6 +657,8 @@ if __name__ == "__main__":
         run_own_channel_daily()
     elif mode == "own-track":
         run_own_channel_track()
+    elif mode == "own-backfill":
+        run_own_channel_backfill()
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")

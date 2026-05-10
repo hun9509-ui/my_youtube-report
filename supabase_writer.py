@@ -357,6 +357,21 @@ def save_own_analysis(video_id: str, gemini_result: dict, comments_result: dict)
         print(f"  ⚠️ own_channel_analysis 저장 실패: {e}")
 
 
+def get_all_own_analyses() -> list:
+    """자체 채널 분석 결과 전체 조회 (영상 정보 포함)"""
+    client = get_client()
+    if not client:
+        return []
+    try:
+        result = client.table('own_channel_analysis')\
+            .select('*, own_channel_videos(*)')\
+            .execute()
+        return result.data
+    except Exception as e:
+        print(f"  ⚠️ own_channel_analysis 조회 실패: {e}")
+        return []
+
+
 def get_tracking_videos() -> list:
     """추적 활성화 중인 자체 채널 영상 목록"""
     client = get_client()
