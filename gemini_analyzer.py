@@ -140,6 +140,76 @@ def analyze_videos_batch(videos, delay=5, model_mode='daily'):
     return results
 
 
+OWN_CHANNEL_PROMPT = """
+당신은 유튜브 채널 "고은언니 한고은" (60대 여성, 살림·라이프, 담백·진정성)의 콘텐츠 전략가입니다.
+방금 이 채널에 올라온 영상을 크리에이터 관점으로 분석해주세요.
+
+영상 제목: {title}
+영상 유형: {video_type}
+설명: {description}
+태그: {tags}
+영상 길이: {duration}
+업로드 초기 조회수: {views}
+
+다음 JSON으로 분석:
+{{
+  "topic": "핵심 주제 (1줄)",
+  "content_structure": "브이로그형/정보전달형/스토리텔링형/리뷰형/토크형",
+  "title_pattern": "질문형/단정형/숫자형/감정형/정보형",
+  "title_emotion_tone": "따뜻함/놀람/친근함/권위감/유머/공감/기대감",
+  "hook_strategy": "시청자를 끌어들이는 전략",
+  "ppl_likely": true,
+  "ppl_signals": "PPL 근거 (없으면 빈 문자열)",
+  "target_audience": "이 영상의 주 타겟층",
+  "predicted_performance": "높음/보통/낮음",
+  "predicted_performance_reason": "예측 이유 (구체적으로)",
+  "strengths": "이 영상 콘텐츠의 구체적 강점 2-3가지",
+  "improvement_points": "다음에 더 잘할 수 있는 구체적 포인트 1-2가지",
+  "thumbnail_suggestion": "썸네일 개선 제안 (없으면 없음)",
+  "competitor_angle": "경쟁 채널들이 비슷한 주제를 다룰 때와 비교한 이 영상의 차별점 또는 개선 방향"
+}}
+
+JSON만 반환하세요.
+"""
+
+
+def analyze_own_video(video_data, retry=3):
+    """자체 채널 영상 분석 (크리에이터 관점)"""
+    _ensure_configured()
+    model_name = config.get_gemini_model('daily')
+    model = GenerativeModel(model_name)
+
+    video_type = video_data.get('video_type', 'longform')
+    prompt = OWN_CHANNEL_PROMPT.format(
+        title=video_data.get('title', ''),
+        video_type='숏츠' if video_type == 'shorts' else '롱폼',
+        description=video_data.get('description', '')[:300],
+        tags=video_data.get('tags', ''),
+        duration=video_data.get('duration', ''),
+        views=video_data.get('view_count', 0),
+    )
+
+    for attempt in range(retry):
+        try:
+            response = model.generate_content(prompt)
+            result = _extract_json(response.text)
+            result['video_id'] = video_data.get('video_id', '')
+            return result
+        except json.JSONDecodeError as e:
+            if attempt < retry - 1:
+                time.sleep(2)
+                continue
+            return {'video_id': video_data.get('video_id', ''), 'error': f'JSON 파싱 실패: {e}'}
+        except Exception as e:
+            err = str(e)
+            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted"]):
+                time.sleep(60)
+                continue
+            return {'video_id': video_data.get('video_id', ''), 'error': err}
+
+    return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
+
+
 def detect_daily_trends(trending_videos):
     """일일 트렌드 영상에서 패턴 감지"""
     _ensure_configured()

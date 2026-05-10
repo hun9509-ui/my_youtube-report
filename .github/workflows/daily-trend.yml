@@ -1,8 +1,8 @@
 name: 일일 트렌드 알림
 
 on:
-  # schedule:
-  #   - cron: '0 1 * * *'    # 일단 비활성. 수동 테스트 후 활성화
+  schedule:
+    - cron: '0 1 * * *'    # 매일 KST 10:00
   workflow_dispatch:
 
 jobs:

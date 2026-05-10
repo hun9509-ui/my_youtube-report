@@ -46,6 +46,8 @@ INITIAL_BATCHES = {
 
 # ===== 자체 채널 =====
 OWN_CHANNEL = "고은언니 한고은"
+OWN_CHANNEL_ID = "UCPFW9tE-hAuyR4037csZAqg"
+OWN_CHANNEL_TRACKING_WEEKS = 5  # 업로드 후 5주 월요일까지 추적
 
 # ===== 분석 설정 =====
 INITIAL_MONTHS = 6
@@ -78,6 +80,8 @@ SHEET_CHANNEL_INSIGHTS = "채널별_성공공식"
 SHEET_TRENDS = "일일_트렌드"
 SHEET_EVENT_KEYWORDS = "일일_사건키워드"
 SHEET_WEEKLY = "주간_리포트"
+SHEET_OWN_ANALYSIS = "자체채널_분석"
+SHEET_OWN_TRACKING = "자체채널_추적"
 
 # 기존 호환성 유지
 SHEET_ANALYSIS = SHEET_DAILY  # 기존 코드 호환

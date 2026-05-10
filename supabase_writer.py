@@ -270,6 +270,186 @@ def save_trend_classified(classified: dict) -> int:
         return 0
  
  
+# ───────────────────────────────────────────────
+# 자체 채널 분석
+# ───────────────────────────────────────────────
+
+def is_own_video_analyzed(video_id: str) -> bool:
+    """이미 수집된 자체 채널 영상인지 확인"""
+    client = get_client()
+    if not client:
+        return False
+    try:
+        result = client.table('own_channel_videos').select('video_id').eq('video_id', video_id).execute()
+        return len(result.data) > 0
+    except Exception:
+        return False
+
+
+def save_own_video(video: dict) -> bool:
+    """자체 채널 영상 저장 (upsert)"""
+    client = get_client()
+    if not client:
+        return False
+    try:
+        client.table('own_channel_videos').upsert({
+            'video_id': video.get('video_id'),
+            'title': video.get('title', ''),
+            'published_at': video.get('published_at'),
+            'video_type': video.get('video_type', 'longform'),
+            'view_count': video.get('view_count', 0),
+            'like_count': video.get('like_count', 0),
+            'comment_count': video.get('comment_count', 0),
+            'duration': video.get('duration', ''),
+            'duration_seconds': video.get('duration_seconds', 0),
+            'thumbnail_url': video.get('thumbnail_url', ''),
+            'video_url': video.get('video_url', ''),
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"  ⚠️ own_channel_videos 저장 실패: {e}")
+        return False
+
+
+def save_own_analysis(video_id: str, gemini_result: dict, comments_result: dict):
+    """자체 채널 분석 결과 저장"""
+    client = get_client()
+    if not client:
+        return
+    today = datetime.now().date().isoformat()
+    gemini = gemini_result or {}
+    comments = comments_result or {}
+    sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
+    try:
+        client.table('own_channel_analysis').upsert({
+            'video_id': video_id,
+            'analysis_date': today,
+            'topic': gemini.get('topic', ''),
+            'content_structure': gemini.get('content_structure', ''),
+            'title_pattern': gemini.get('title_pattern', ''),
+            'title_emotion_tone': gemini.get('title_emotion_tone', ''),
+            'hook_strategy': gemini.get('hook_strategy', ''),
+            'ppl_likely': gemini.get('ppl_likely', False),
+            'ppl_signals': gemini.get('ppl_signals', ''),
+            'target_audience': gemini.get('target_audience', ''),
+            'predicted_performance': gemini.get('predicted_performance', ''),
+            'predicted_performance_reason': gemini.get('predicted_performance_reason', ''),
+            'strengths': gemini.get('strengths', ''),
+            'improvement_points': gemini.get('improvement_points', ''),
+            'thumbnail_suggestion': gemini.get('thumbnail_suggestion', ''),
+            'competitor_angle': gemini.get('competitor_angle', ''),
+            'sentiment': sentiment,
+            'praise_points': comments.get('praise_points', []),
+            'complaints': comments.get('complaints', []),
+            'next_video_requests': comments.get('next_video_requests', []),
+            'new_viewer_signals': comments.get('new_viewer_signals', ''),
+            'fan_engagement': comments.get('fan_engagement', ''),
+            'viral_signals': comments.get('viral_signals', ''),
+            'revisit_intent': comments.get('revisit_intent', 0),
+            'ppl_reaction': comments.get('ppl_reaction', ''),
+            'creator_feedback': comments.get('creator_feedback', ''),
+            'comments_summary': comments.get('summary', ''),
+            'gemini_raw': gemini,
+            'deepseek_raw': comments,
+        }).execute()
+        print(f"  💾 Supabase: own_channel_analysis 저장 ({video_id[:8]}...)")
+    except Exception as e:
+        print(f"  ⚠️ own_channel_analysis 저장 실패: {e}")
+
+
+def get_tracking_videos() -> list:
+    """추적 활성화 중인 자체 채널 영상 목록"""
+    client = get_client()
+    if not client:
+        return []
+    try:
+        result = client.table('own_channel_videos').select('*').eq('tracking_active', True).execute()
+        return result.data
+    except Exception as e:
+        print(f"  ⚠️ 추적 영상 조회 실패: {e}")
+        return []
+
+
+def count_snapshots(video_id: str) -> int:
+    """영상의 스냅샷 횟수"""
+    client = get_client()
+    if not client:
+        return 0
+    try:
+        result = client.table('own_channel_snapshots').select('id', count='exact').eq('video_id', video_id).execute()
+        return result.count or 0
+    except Exception as e:
+        print(f"  ⚠️ 스냅샷 카운트 실패: {e}")
+        return 0
+
+
+def get_last_snapshot(video_id: str) -> dict | None:
+    """마지막 스냅샷 조회"""
+    client = get_client()
+    if not client:
+        return None
+    try:
+        result = client.table('own_channel_snapshots').select('*').eq('video_id', video_id)\
+            .order('week_number', desc=True).limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        print(f"  ⚠️ 스냅샷 조회 실패: {e}")
+        return None
+
+
+def save_own_snapshot(video_id: str, week_number: int, current_stats: dict,
+                      prev_view_count: int, comment_analysis: dict = None):
+    """주별 스냅샷 저장"""
+    client = get_client()
+    if not client:
+        return
+    today = datetime.now().date().isoformat()
+    view_growth = current_stats.get('view_count', 0) - prev_view_count
+    try:
+        client.table('own_channel_snapshots').insert({
+            'video_id': video_id,
+            'snapshot_date': today,
+            'week_number': week_number,
+            'view_count': current_stats.get('view_count', 0),
+            'like_count': current_stats.get('like_count', 0),
+            'comment_count': current_stats.get('comment_count', 0),
+            'view_growth': view_growth,
+            'comment_analysis': comment_analysis,
+        }).execute()
+        print(f"  📸 스냅샷 week#{week_number}: {video_id[:8]}... {current_stats.get('view_count',0):,}회 (+{view_growth:,})")
+    except Exception as e:
+        print(f"  ⚠️ 스냅샷 저장 실패: {e}")
+
+
+def update_own_video_stats(video_id: str, stats: dict):
+    """추적 시 최신 통계 업데이트"""
+    client = get_client()
+    if not client:
+        return
+    try:
+        client.table('own_channel_videos').update({
+            'view_count': stats.get('view_count', 0),
+            'like_count': stats.get('like_count', 0),
+            'comment_count': stats.get('comment_count', 0),
+            'last_tracked_at': datetime.now().isoformat(),
+        }).eq('video_id', video_id).execute()
+    except Exception as e:
+        print(f"  ⚠️ 통계 업데이트 실패: {e}")
+
+
+def deactivate_tracking(video_id: str):
+    """5주 추적 완료 후 비활성화"""
+    client = get_client()
+    if not client:
+        return
+    try:
+        client.table('own_channel_videos').update({'tracking_active': False})\
+            .eq('video_id', video_id).execute()
+        print(f"  ✅ 추적 종료: {video_id[:8]}... (5주 완료)")
+    except Exception as e:
+        print(f"  ⚠️ 추적 비활성화 실패: {e}")
+
+
 def get_weekly_trend_summary(days_back: int = 7) -> dict:
     """지난 N일간 트렌드 데이터 종합 (월요일 알림용)"""
     client = get_client()

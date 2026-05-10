@@ -112,31 +112,34 @@ def get_channel_videos(channel_id, months_back=6):
     }
 
 
-def get_video_details(video_ids):
-    """영상 상세 정보 일괄 조회 (50개씩) + 5분 이상 영상만 필터"""
+def get_video_details(video_ids, min_duration=None):
+    """영상 상세 정보 일괄 조회 (50개씩).
+    min_duration=None이면 기본 5분 필터 적용. 0이면 숏츠 포함 전체.
+    """
+    if min_duration is None:
+        min_duration = MIN_VIDEO_DURATION_SECONDS
     youtube = get_youtube_client()
     all_details = []
     filtered_count = 0
-    
+
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i+50]
         response = youtube.videos().list(
             id=','.join(batch),
             part='snippet,statistics,contentDetails'
         ).execute()
-        
+
         for item in response.get('items', []):
             stats = item.get('statistics', {})
             snippet = item.get('snippet', {})
             content = item.get('contentDetails', {})
             duration_str = content.get('duration', '')
             duration_seconds = parse_duration(duration_str)
-            
-            # 5분 미만 영상은 제외 (숏폼/짧은 클립)
-            if duration_seconds < MIN_VIDEO_DURATION_SECONDS:
+
+            if min_duration > 0 and duration_seconds < min_duration:
                 filtered_count += 1
                 continue
-            
+
             all_details.append({
                 'video_id': item['id'],
                 'title': snippet.get('title', ''),
@@ -152,11 +155,19 @@ def get_video_details(video_ids):
                 'thumbnail_url': snippet.get('thumbnails', {}).get('high', {}).get('url', ''),
                 'video_url': f"https://youtube.com/watch?v={item['id']}"
             })
-    
+
     if filtered_count > 0:
-        print(f"  📏 5분 미만 영상 {filtered_count}개 제외됨")
-    
+        print(f"  📏 {min_duration//60}분 미만 영상 {filtered_count}개 제외됨")
+
     return all_details
+
+
+def is_shorts(video):
+    """숏츠 여부 판별: #shorts 태그 또는 60초 이하"""
+    title = video.get('title', '').lower()
+    tags = video.get('tags', '').lower()
+    duration_seconds = video.get('duration_seconds', 0)
+    return '#shorts' in title or '#shorts' in tags or duration_seconds <= 60
 
 
 def get_video_comments(video_id, max_comments=200):

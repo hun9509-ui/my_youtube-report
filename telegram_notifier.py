@@ -172,6 +172,65 @@ def send_irregular_alert(video: dict):
     send_message(msg)
  
  
+def send_own_channel_alert(video: dict, gemini: dict, comments: dict):
+    """자체 채널 새 영상 분석 알림"""
+    g = gemini or {}
+    c = comments or {}
+    emoji = "📱" if video.get('video_type') == 'shorts' else "🎬"
+    vtype = '숏츠' if video.get('video_type') == 'shorts' else '롱폼'
+
+    msg = (
+        f"{emoji} <b>[자체채널 {vtype}] 새 영상 분석</b>\n\n"
+        f"📌 <b>{video.get('title', '')}</b>\n"
+        f"📅 업로드: {str(video.get('published_at', ''))[:10]}\n"
+        f"👁 초기 조회수: {video.get('view_count', 0):,}회\n\n"
+        f"🎯 <b>콘텐츠 분석</b>\n"
+        f"  주제: {g.get('topic', '')}\n"
+        f"  구조: {g.get('content_structure', '')}\n"
+        f"  성과 예측: {g.get('predicted_performance', '')} — {g.get('predicted_performance_reason', '')[:80]}\n"
+        f"  강점: {g.get('strengths', '')[:120]}\n"
+        f"  개선: {g.get('improvement_points', '')[:120]}\n"
+    )
+
+    if g.get('thumbnail_suggestion') and g.get('thumbnail_suggestion') != '없음':
+        msg += f"  썸네일: {g.get('thumbnail_suggestion', '')[:80]}\n"
+
+    if c and 'summary' in c:
+        msg += (
+            f"\n💬 <b>댓글 여론</b>\n"
+            f"  {c.get('summary', '')}\n"
+            f"  피드백: {c.get('creator_feedback', '')[:150]}\n"
+        )
+        reqs = c.get('next_video_requests', [])
+        if reqs:
+            msg += "\n📝 <b>다음 영상 요청</b>\n"
+            for req in reqs[:3]:
+                msg += f"  • {req}\n"
+
+    msg += f"\n🔗 {video.get('video_url', '')}"
+    send_message(msg)
+
+
+def send_own_tracking_summary(results: list):
+    """매주 월요일 자체 채널 추적 요약 알림"""
+    if not results:
+        send_message("📺 자체 채널 추적: 이번 주 추적 영상 없음")
+        return
+
+    msg = "📊 <b>자체 채널 주간 추적</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    for r in results:
+        emoji = "📱" if r.get('video_type') == 'shorts' else "🎬"
+        growth = r.get('view_growth', 0)
+        growth_str = f"+{growth:,}" if growth >= 0 else f"{growth:,}"
+        week = r.get('week_number', '')
+        done = " ✅완료" if week >= 5 else ""
+        msg += (
+            f"{emoji} <b>Week {week}{done}</b> | {r.get('title', '')[:35]}\n"
+            f"  누적 {r.get('view_count', 0):,}회  이번 주 {growth_str}회\n\n"
+        )
+    send_message(msg)
+
+
 def send_weekly_trend_alert(weekly_data: dict):
     """월요일 주간 트렌드 종합 알림 (트랙 A + 트랙 B 투트랙)"""
     track_a = weekly_data.get('track_a', [])

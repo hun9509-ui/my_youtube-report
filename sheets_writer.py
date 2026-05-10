@@ -197,6 +197,93 @@ def get_videos_from_sheet(days_back=7):
         return result['videos']
     return []
 
+def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
+    """자체 채널 새 영상 분석 저장"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    g = gemini or {}
+    c = comments or {}
+    sentiment = c.get('sentiment', {}) if isinstance(c, dict) else {}
+
+    row = [
+        today,
+        '숏츠' if video.get('video_type') == 'shorts' else '롱폼',
+        video.get('video_id', ''),
+        video.get('title', ''),
+        video.get('published_at', '')[:10],
+        video.get('view_count', 0),
+        video.get('like_count', 0),
+        video.get('comment_count', 0),
+        video.get('duration', ''),
+        g.get('topic', ''),
+        g.get('content_structure', ''),
+        g.get('title_pattern', ''),
+        g.get('title_emotion_tone', ''),
+        g.get('hook_strategy', ''),
+        str(g.get('ppl_likely', '')),
+        g.get('ppl_signals', ''),
+        g.get('target_audience', ''),
+        g.get('predicted_performance', ''),
+        g.get('predicted_performance_reason', ''),
+        g.get('strengths', ''),
+        g.get('improvement_points', ''),
+        g.get('thumbnail_suggestion', ''),
+        g.get('competitor_angle', ''),
+        sentiment.get('positive', ''),
+        sentiment.get('negative', ''),
+        ', '.join(c.get('praise_points', [])) if isinstance(c.get('praise_points'), list) else '',
+        ', '.join(c.get('complaints', [])) if isinstance(c.get('complaints'), list) else '',
+        ', '.join(c.get('next_video_requests', [])) if isinstance(c.get('next_video_requests'), list) else '',
+        c.get('new_viewer_signals', ''),
+        c.get('fan_engagement', ''),
+        c.get('viral_signals', ''),
+        str(c.get('revisit_intent', '')),
+        c.get('ppl_reaction', ''),
+        c.get('creator_feedback', ''),
+        c.get('summary', ''),
+        video.get('video_url', ''),
+    ]
+
+    result = call_webhook('save_own_analysis', {
+        'sheet_name': config.SHEET_OWN_ANALYSIS,
+        'rows': [row],
+        'headers': [
+            '분석일', '유형', '영상ID', '제목', '업로드일', '조회수', '좋아요', '댓글수', '영상길이',
+            '주제', '콘텐츠구조', '제목패턴', '제목감정톤', '후킹전략', 'PPL여부', 'PPL근거',
+            '타겟층', '성과예측', '예측이유', '콘텐츠강점', '개선포인트', '썸네일제안', '경쟁사비교',
+            '여론_긍정', '여론_부정', '칭찬포인트', '불만사항', '다음영상요청',
+            '신규시청자신호', '팬반응', '바이럴시그널', '재방문의사%', 'PPL반응', '크리에이터피드백',
+            '댓글요약', 'URL',
+        ],
+        'dedupe_column': 2,
+    })
+    return 1 if result else 0
+
+
+def save_own_tracking(tracking_results: list) -> int:
+    """자체 채널 주별 추적 스냅샷 저장"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    rows = []
+    for r in tracking_results:
+        growth = r.get('view_growth', 0)
+        rows.append([
+            today,
+            r.get('week_number', ''),
+            '숏츠' if r.get('video_type') == 'shorts' else '롱폼',
+            r.get('title', ''),
+            r.get('published_at', '')[:10] if r.get('published_at') else '',
+            r.get('view_count', 0),
+            f"+{growth:,}" if growth >= 0 else f"{growth:,}",
+        ])
+    if not rows:
+        return 0
+    result = call_webhook('save_own_tracking', {
+        'sheet_name': config.SHEET_OWN_TRACKING,
+        'rows': rows,
+        'headers': ['추적일', '주차', '유형', '제목', '업로드일', '누적조회수', '주간증가'],
+    })
+    return len(rows) if result else 0
+
+
 def save_trend_classified(classified: dict) -> int:
     """트렌드 분류 결과를 시트에 저장 (트랙 A/B/이레귤러 통합)"""
     today = datetime.now().strftime('%Y-%m-%d')

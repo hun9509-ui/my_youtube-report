@@ -1,12 +1,12 @@
-name: 주간 리포트
+name: 자체 채널 새 영상 분석
 
 on:
   schedule:
-    - cron: '0 1 * * 1'    # 매주 월요일 KST 10:00
+    - cron: '0 16 * * *'    # 매일 KST 01:00 (일일 수집 1시간 후)
   workflow_dispatch:
 
 jobs:
-  weekly-report:
+  own-channel-collect:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -23,7 +23,7 @@ jobs:
         run: |
           echo "$GCP_KEY" > /tmp/gcp-key.json
           echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-key.json" >> $GITHUB_ENV
-      - name: 주간 리포트 실행
+      - name: 자체 채널 분석 실행
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -33,4 +33,4 @@ jobs:
           GOOGLE_WEBHOOK_URL: ${{ secrets.GOOGLE_WEBHOOK_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python -u main.py weekly
+        run: python -u main.py own-channel

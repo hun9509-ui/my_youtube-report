@@ -410,7 +410,151 @@ def run_trend_weekly():
 
 
 # ───────────────────────────────────────────────
-# 모드 5: 주간 채널 리포트 (기존)
+# 모드 5: 자체 채널 새 영상 분석
+# ───────────────────────────────────────────────
+
+def run_own_channel_daily():
+    """자체 채널 새 영상 감지 + 즉시 분석 (숏츠 포함)"""
+    print(f"📺 자체 채널 분석 시작 ({datetime.now()})")
+    start = time.time()
+
+    raw_videos, _ = yt.get_channel_videos(config.OWN_CHANNEL_ID, months_back=1)
+    if not raw_videos:
+        tg.send_message("📺 자체 채널: 영상 수집 실패")
+        return
+
+    video_ids = [v['video_id'] for v in raw_videos]
+    detailed = yt.get_video_details(video_ids, min_duration=0)  # 숏츠 포함
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    recent = [
+        v for v in detailed
+        if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')) > cutoff
+    ]
+
+    new_videos = [v for v in recent if not db.is_own_video_analyzed(v['video_id'])]
+
+    if not new_videos:
+        print("📭 새 영상 없음")
+        tg.send_message(f"📺 자체 채널: 새 영상 없음 ({datetime.now().strftime('%m/%d')})")
+        return
+
+    print(f"📹 새 영상 {len(new_videos)}개 발견")
+
+    for video in new_videos:
+        try:
+            video['video_type'] = 'shorts' if yt.is_shorts(video) else 'longform'
+            vtype = '숏츠' if video['video_type'] == 'shorts' else '롱폼'
+            print(f"\n{'='*50}")
+            print(f"📹 [{vtype}] {video['title'][:50]}")
+
+            db.save_own_video(video)
+
+            gemini_result = gemini.analyze_own_video(video)
+            print(f"  ✅ Gemini 분석 완료")
+
+            comments_result = {}
+            if video.get('comment_count', 0) > 0:
+                comments = yt.get_video_comments(video['video_id'], max_comments=config.TOP_COMMENTS_COUNT)
+                if comments:
+                    comments_result = ds.analyze_own_video_comments(
+                        video['title'], comments, video['video_type']
+                    )
+                    print(f"  ✅ 댓글 분석 완료")
+            else:
+                print(f"  ⚠️ 댓글 없음 - 댓글 분석 skip")
+
+            db.save_own_analysis(video['video_id'], gemini_result, comments_result)
+            sheets.save_own_analysis(video, gemini_result, comments_result)
+            tg.send_own_channel_alert(video, gemini_result, comments_result)
+            time.sleep(3)
+
+        except Exception as e:
+            print(f"❌ 영상 분석 실패 ({video.get('video_id', '')}): {e}")
+            traceback.print_exc()
+            tg.send_error_alert(str(e), f"자체채널 - {video.get('title', '')[:30]}")
+
+    duration = time.time() - start
+    print(f"✅ 자체 채널 분석 완료 ({duration/60:.1f}분)")
+
+
+# ───────────────────────────────────────────────
+# 모드 6: 자체 채널 주간 추적 (매주 월요일)
+# ───────────────────────────────────────────────
+
+def run_own_channel_track():
+    """매주 월요일 - 업로드 후 5주까지 스냅샷 추적"""
+    print(f"📊 자체 채널 추적 시작 ({datetime.now()})")
+    start = time.time()
+
+    tracking_videos = db.get_tracking_videos()
+    if not tracking_videos:
+        print("📭 추적 중인 영상 없음")
+        tg.send_own_tracking_summary([])
+        return
+
+    print(f"📋 추적 대상: {len(tracking_videos)}개")
+    results = []
+
+    for tracked in tracking_videos:
+        video_id = tracked['video_id']
+        try:
+            snap_count = db.count_snapshots(video_id)
+
+            if snap_count >= config.OWN_CHANNEL_TRACKING_WEEKS:
+                db.deactivate_tracking(video_id)
+                continue
+
+            week_number = snap_count + 1
+
+            details = yt.get_video_details([video_id], min_duration=0)
+            if not details:
+                print(f"  ⚠️ 영상 정보 없음: {video_id}")
+                continue
+            current = details[0]
+
+            last_snap = db.get_last_snapshot(video_id)
+            prev_views = last_snap['view_count'] if last_snap else tracked.get('view_count', 0)
+
+            # 1주, 2주, 5주차만 댓글 분석 (API 절약)
+            comment_analysis = None
+            if week_number in [1, 2, 5] and current.get('comment_count', 0) > 0:
+                comments = yt.get_video_comments(video_id, max_comments=100)
+                if comments:
+                    comment_analysis = ds.analyze_own_video_comments(
+                        tracked['title'], comments, tracked.get('video_type', 'longform')
+                    )
+
+            db.save_own_snapshot(video_id, week_number, current, prev_views, comment_analysis)
+            db.update_own_video_stats(video_id, current)
+
+            if week_number >= config.OWN_CHANNEL_TRACKING_WEEKS:
+                db.deactivate_tracking(video_id)
+
+            results.append({
+                'title': tracked['title'],
+                'video_type': tracked.get('video_type', 'longform'),
+                'published_at': str(tracked.get('published_at', '')),
+                'week_number': week_number,
+                'view_count': current.get('view_count', 0),
+                'view_growth': current.get('view_count', 0) - prev_views,
+            })
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"⚠️ 추적 실패 ({video_id}): {e}")
+
+    if results:
+        sheets.save_own_tracking(results)
+
+    tg.send_own_tracking_summary(results)
+
+    duration = time.time() - start
+    print(f"✅ 자체 채널 추적 완료 ({duration:.0f}초, {len(results)}개)")
+
+
+# ───────────────────────────────────────────────
+# 모드 7: 주간 채널 리포트 (기존)
 # ───────────────────────────────────────────────
 
 def run_weekly_report():
@@ -479,6 +623,10 @@ if __name__ == "__main__":
         run_trend_weekly()
     elif mode == "weekly":
         run_weekly_report()
+    elif mode == "own-channel":
+        run_own_channel_daily()
+    elif mode == "own-track":
+        run_own_channel_track()
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")

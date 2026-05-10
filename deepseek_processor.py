@@ -122,6 +122,46 @@ success_drivers의 각 항목은 성공 기여도 점수 (0~10 정수).
     return call_deepseek(prompt, complex_task=True)
 
 
+def analyze_own_video_comments(video_title, comments, video_type='longform'):
+    """자체 채널 댓글 분석 - 크리에이터 관점"""
+    if not comments:
+        return {'error': '댓글 없음'}
+
+    top_comments = sorted(comments, key=lambda x: x.get('like_count', 0), reverse=True)[:200]
+    comments_text = "\n".join([
+        f"[👍{c['like_count']}] {c['text'][:200]}"
+        for c in top_comments
+    ])
+    vtype = '숏츠' if video_type == 'shorts' else '롱폼'
+
+    prompt = f"""
+영상 제목: {video_title}
+영상 유형: {vtype}
+
+상위 댓글 {len(top_comments)}개:
+{comments_text[:8000]}
+
+크리에이터 관점에서 이 댓글들을 분석해 다음 JSON으로 답변하세요:
+{{
+  "sentiment": {{"positive": 0, "negative": 0, "neutral": 0}},
+  "praise_points": ["시청자가 구체적으로 좋아한 점 3가지"],
+  "complaints": ["불만 또는 개선 요청 (없으면 빈 배열)"],
+  "next_video_requests": ["시청자가 다음에 보고 싶어하는 콘텐츠 3가지 - 구체적 표현 기반"],
+  "new_viewer_signals": "처음 방문 시청자 댓글 패턴 (없으면 없음)",
+  "fan_engagement": "고정 팬 반응 특징",
+  "viral_signals": "공유·추천·감동 댓글 패턴 (없으면 없음)",
+  "revisit_intent": 0,
+  "ppl_reaction": "PPL/협찬 언급 반응 (없으면 없음)",
+  "creator_feedback": "크리에이터에게 전달할 핵심 피드백 1-2줄",
+  "summary": "전반적 여론 한 줄 요약"
+}}
+
+sentiment는 0~100 정수. revisit_intent는 재방문/재구독 의사 비율 (0~100 정수).
+JSON만 반환하세요.
+"""
+    return call_deepseek(prompt, complex_task=False)
+
+
 def derive_channel_success_formula(channel_name, videos_with_analysis):
     """채널의 성공 공식 도출"""
     if len(videos_with_analysis) < 5:
