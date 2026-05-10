@@ -575,6 +575,47 @@ def run_score_backfill():
     print(f"✅ 백필 완료 ({len(all_scores)}개, {duration:.0f}초)")
 
 
+def run_score_sheets_sync():
+    """Supabase video_scores → 구글 시트 전략_스코어 탭 재동기화"""
+    print(f"📊 스코어 시트 동기화 시작 ({datetime.now()})")
+    start = time.time()
+
+    client = db.get_client()
+    if not client:
+        print("❌ Supabase 연결 실패")
+        return
+
+    try:
+        result = client.table('video_scores').select('*')\
+            .eq('score_version', config.SCORE_VERSION).execute()
+        scores = result.data
+        if not scores:
+            print("📭 동기화할 스코어 없음")
+            tg.send_message(f"📊 스코어 동기화: {config.SCORE_VERSION} 데이터 없음")
+            return
+
+        video_ids = [s['video_id'] for s in scores]
+        vid_res = client.table('videos')\
+            .select('video_id,title,channel_title,video_url,view_count,published_at')\
+            .in_('video_id', video_ids).execute()
+        videos_map = {v['video_id']: v for v in vid_res.data}
+
+        saved = sheets.save_strategy_scores(scores, videos_map)
+        duration = time.time() - start
+        tg.send_message(
+            f"📊 <b>전략 스코어 시트 동기화 완료</b>\n\n"
+            f"📺 Supabase 스코어: {len(scores)}개\n"
+            f"✅ 시트 신규 추가: {saved}개\n"
+            f"⏱️ 소요: {duration:.0f}초"
+        )
+        print(f"✅ 동기화 완료: {saved}개 추가 ({duration:.0f}초)")
+
+    except Exception as e:
+        print(f"❌ 동기화 실패: {e}")
+        traceback.print_exc()
+        tg.send_error_alert(str(e), "score-sheets-sync")
+
+
 def run_own_channel_backfill():
     """Supabase에 저장된 자체 채널 분석 결과 → 구글 시트 재저장"""
     print(f"📦 자체 채널 백필 시작")
@@ -763,6 +804,8 @@ if __name__ == "__main__":
         run_own_channel_backfill()
     elif mode == "score-backfill":
         run_score_backfill()
+    elif mode == "score-sheets-sync":
+        run_score_sheets_sync()
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")

@@ -1,10 +1,37 @@
 """
 구글 시트 저장 모듈 (Apps Script 웹훅)
+전략_스코어 탭은 gspread 직접 쓰기 사용
 """
+import os
 import requests
 import json
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 import config
+
+
+_gspread_client = None
+
+def _get_gspread_client():
+    global _gspread_client
+    if _gspread_client is not None:
+        return _gspread_client
+    creds_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    if not creds_path:
+        print("  ⚠️ GOOGLE_APPLICATION_CREDENTIALS 미설정 — gspread 사용 불가")
+        return None
+    try:
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive',
+        ]
+        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+        _gspread_client = gspread.authorize(creds)
+        return _gspread_client
+    except Exception as e:
+        print(f"  ⚠️ gspread 초기화 실패: {e}")
+        return None
 
 
 def call_webhook(action, data):
@@ -289,11 +316,20 @@ def save_own_tracking(tracking_results: list) -> int:
 
 
 def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
-    """전략 스코어 시트 저장 (전략_스코어 탭)"""
+    """전략 스코어 시트 직접 저장 (gspread, 웹훅 미사용)"""
+    if not scores:
+        return 0
+
     today = datetime.now().strftime('%Y-%m-%d')
     vm = videos_map or {}
-    rows = []
+    headers = [
+        '점수일', '버전', '출처', '채널명', '제목', '영상ID', '조회수', '업로드일',
+        '한고은적합도', '실행용이성', '반복가능성', '참신성', '리스크', 'PPL잠재력',
+        '트렌드수명', '지연리스크', '에버그린성', '수명타입',
+        '우선순위점수', '추천액션', '전략이유', 'URL',
+    ]
 
+    rows = []
     for s in scores:
         vid = vm.get(s.get('video_id', ''), {})
         rows.append([
@@ -321,21 +357,38 @@ def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
             vid.get('video_url', ''),
         ])
 
-    if not rows:
-        return 0
+    try:
+        gc = _get_gspread_client()
+        if not gc:
+            return 0
 
-    result = call_webhook('save_strategy_scores', {
-        'sheet_name': config.SHEET_SCORES,
-        'rows': rows,
-        'headers': [
-            '점수일', '버전', '출처', '채널명', '제목', '영상ID', '조회수', '업로드일',
-            '한고은적합도', '실행용이성', '반복가능성', '참신성', '리스크', 'PPL잠재력',
-            '트렌드수명', '지연리스크', '에버그린성', '수명타입',
-            '우선순위점수', '추천액션', '전략이유', 'URL',
-        ],
-        'dedupe_column': 5,
-    })
-    return result.get('saved_count', 0) if result else 0
+        sh = gc.open_by_key(config.GOOGLE_SHEET_ID)
+        try:
+            ws = sh.worksheet(config.SHEET_SCORES)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=config.SHEET_SCORES, rows=5000, cols=len(headers))
+            ws.append_row(headers, value_input_option='USER_ENTERED')
+
+        existing = ws.get_all_values()
+        if not existing:
+            ws.append_row(headers, value_input_option='USER_ENTERED')
+            existing = [headers]
+
+        # 영상ID (col F, index 5) 기준 중복 제거
+        existing_ids = {row[5] for row in existing[1:] if len(row) > 5 and row[5]}
+        new_rows = [r for r in rows if r[5] not in existing_ids]
+
+        if not new_rows:
+            print(f"  ⏩ 전략_스코어: 신규 없음 ({len(existing_ids)}개 기존)")
+            return 0
+
+        ws.append_rows(new_rows, value_input_option='USER_ENTERED')
+        print(f"  📊 전략_스코어 시트: {len(new_rows)}개 저장 (gspread)")
+        return len(new_rows)
+
+    except Exception as e:
+        print(f"  ⚠️ 전략_스코어 시트 저장 실패 (gspread): {e}")
+        return 0
 
 
 def save_trend_classified(classified: dict) -> int:
