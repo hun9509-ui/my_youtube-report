@@ -15,12 +15,16 @@ def call_webhook(action, data):
     try:
         response = requests.post(config.GOOGLE_WEBHOOK_URL, json=payload, timeout=120)
         if response.status_code == 200:
-            return response.json()
+            result = response.json()
+            if 'error' in result:
+                print(f"  ❌ 웹훅 오류 [{action}]: {result['error']}")
+                return None
+            return result
         else:
-            print(f"웹훅 오류 {response.status_code}: {response.text[:200]}")
+            print(f"  ❌ 웹훅 HTTP {response.status_code} [{action}]: {response.text[:300]}")
             return None
     except Exception as e:
-        print(f"웹훅 호출 실패: {e}")
+        print(f"  ❌ 웹훅 호출 실패 [{action}]: {e}")
         return None
 
 
