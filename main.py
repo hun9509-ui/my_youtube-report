@@ -758,6 +758,7 @@ def run_weekly_report():
 
         report = ds.generate_weekly_report(insights, top)
         sheets.save_weekly_report(report)
+        db.save_weekly_report(report)
         top_priority = db.get_top_priority_videos(limit=5, days_back=7)
         tg.send_weekly_report_alert(report, top_priority)
         print("✅ 주간 채널 리포트 완료")

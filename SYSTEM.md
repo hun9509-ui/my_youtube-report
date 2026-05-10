@@ -1,6 +1,6 @@
 # 한고은 채널 분석 시스템
 
-> **현재 버전**: v1.2 (2026-05-10)  
+> **현재 버전**: v1.2 (2026-05-11)  
 > **목적**: 경쟁 채널 10개 + 자체 채널 자동 분석 → 콘텐츠 전략 인사이트 도출
 
 ---
@@ -87,6 +87,7 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `supabase_writer.py` | Supabase(PostgreSQL) 이중 저장 |
 | `telegram_notifier.py` | 텔레그램 봇 알림 |
 | `trend_classifier.py` | 키워드 룰 기반 트렌드 분류 (AI 없음, 100% 재현 가능) |
+| `strategy_scorer.py` | 룰 기반 전략 스코어 산출 (API 호출 없음, 결정론적) |
 
 ---
 
@@ -104,6 +105,8 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `python main.py own-channel` | 자체 채널 새 영상 감지·즉시 분석 |
 | `python main.py own-track` | 자체 채널 주간 추적 스냅샷 |
 | `python main.py own-backfill` | Supabase → 구글 시트 재동기화 |
+| `python main.py score-backfill` | 기존 분석 전체에 전략 스코어 소급 산출 |
+| `python main.py score-sheets-sync` | Supabase 스코어 → 구글 시트 동기화 |
 
 ### GitHub Actions 자동화 스케줄
 
@@ -111,10 +114,12 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 |---|---|---|
 | `daily-collection.yml` | 평일 00:00 | `daily` |
 | `daily-trend.yml` | 매일 10:00 | `trend-collect` |
-| `weekly-report.yml` | 월요일 10:00 | `weekly` |
+| `weekly-report.yml` | 월요일 00:00 | `weekly` |
 | `weekly-trend.yml` | 월요일 11:00 | `trend-weekly` |
 | `own-channel-collect.yml` | 매일 01:00 | `own-channel` |
 | `own-channel-track.yml` | 월요일 12:00 | `own-track` |
+| `score-backfill.yml` | 수동 실행 | `score-backfill` |
+| `score-sheets-sync.yml` | 수동 실행 | `score-sheets-sync` |
 
 ---
 
@@ -177,6 +182,27 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `ppl_reaction` | PPL/협찬 반응 |
 | `creator_feedback` | 크리에이터에게 전달할 핵심 피드백 |
 
+### 전략 스코어 (strategy_scorer.py — API 없음, 룰 기반)
+
+> `config.SCORE_VERSION = "v1.2"` 기준. 분석 결과를 입력으로 받아 결정론적으로 산출.
+
+| 항목 | 설명 |
+|---|---|
+| `hangoeun_fit_score` | 한고은 채널 적합도 (0~100) |
+| `execution_score` | 제작 실행 난이도 역산 점수 (높을수록 쉽게 만들 수 있음) |
+| `repeatability_score` | 시리즈·반복 기획 가능성 (0~100) |
+| `novelty_score` | 차별화·신선도 (0~100) |
+| `risk_score` | 브랜드 리스크 (낮을수록 안전) |
+| `ppl_potential_score` | PPL/협찬 유치 가능성 (0~100) |
+| `trend_lifespan_score` | 트렌드 지속성 (EVERGREEN=90/MID_TERM=60/FAST_TREND=30) |
+| `upload_delay_risk` | 업로드 지연 리스크 (FAST_TREND=80 → 빠른 실행 필요) |
+| `evergreen_score` | 에버그린 콘텐츠 점수 (0~100) |
+| `content_lifespan_type` | FAST_TREND / MID_TERM / EVERGREEN |
+| `priority_score` | 종합 우선순위 점수 (가중합, 0~100) |
+| `recommended_action` | 바로 기획화 / 각색 후 기획 / 아이디어 보관 / 우선순위 낮음 |
+| `strategy_reason` | 판정 근거 한 문장 |
+| `rule_trace` | 각 지표별 점수 계산 상세 내역 (JSONB) |
+
 ### DeepSeek 분석 - 대박 영상 심층 분석 (채널 평균 × 2.0배 이상)
 
 | 항목 | 설명 |
@@ -204,6 +230,7 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `주간_리포트` | 주간 채널 리포트 |
 | `자체채널_분석` | 자체 채널 새 영상 즉시 분석 |
 | `자체채널_추적` | 자체 채널 업로드 후 5주 추적 스냅샷 |
+| `전략_스코어` | 영상별 전략 스코어 (우선순위·적합도 등 12개 지표) |
 
 ### Supabase 테이블
 
@@ -218,6 +245,7 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `own_channel_videos` | 자체 채널 영상 목록 |
 | `own_channel_analysis` | 자체 채널 즉시 분석 |
 | `own_channel_snapshots` | 자체 채널 주간 추적 스냅샷 |
+| `video_scores` | 영상별 전략 스코어 (video_id + score_version upsert) |
 
 ---
 
@@ -251,6 +279,7 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 - **Gemini 모델**: `gemini-2.5-flash` (Vertex AI, us-central1, GCP 서비스 계정 인증)
 - **DeepSeek 모델**: 단순 작업 → `deepseek-v4-flash` / 복잡 작업 → `deepseek-v4-pro`
 - **분석 버전 추적**: `config.ANALYSIS_VERSION`을 `gemini_raw._version` / `deepseek_raw._version` JSONB 필드에 자동 삽입 → 프롬프트/모델 변경 시 데이터 계보 추적 가능
+- **전략 스코어링**: 분석 완료 직후 `_score_and_save()` 자동 호출. 실패해도 분석 저장에 영향 없음. 기존 데이터 소급 적용 시 `score-backfill` 사용
 
 ### 자체 채널 추적 규칙
 - 업로드 감지: 매일 KST 01:00 자동 실행, 최근 7일 신규 영상 확인
@@ -310,6 +339,19 @@ hangoeun_fit×0.30 + repeatability×0.18 + evergreen×0.15
 + novelty×0.12 + ppl_potential×0.10 + trend_lifespan×0.08
 + execution×0.07 − risk×0.15 − upload_delay_risk×0.10
 ```
+
+---
+
+### v1.2 (2026-05-11) — 전략 스코어링 추가
+**Added**
+- `strategy_scorer.py`: 룰 기반 전략 스코어 산출 (API 없음, 결정론적) — 12개 지표 + `priority_score` + `recommended_action`
+- `video_scores` Supabase 테이블: `video_id + score_version` upsert
+- `전략_스코어` 구글 시트 탭
+- `score-backfill` / `score-sheets-sync` 실행 모드 및 GitHub Actions 워크플로우 추가
+- 분석 완료 후 `_score_and_save()` 자동 호출 (실패 격리)
+
+**Changed**
+- `weekly-report.yml` 스케줄: 월요일 10:00 → 00:00 KST
 
 ---
 

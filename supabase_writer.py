@@ -180,6 +180,31 @@ def save_daily_analysis(analyses):
         return 0
 
 
+def save_weekly_report(report: dict) -> bool:
+    """주간 리포트 저장"""
+    client = get_client()
+    if not client:
+        return False
+    today = datetime.now().date().isoformat()
+    try:
+        client.table('weekly_reports').insert({
+            'report_date': today,
+            'week_summary': report.get('week_summary', ''),
+            'top_performing_channels': report.get('top_performing_channels', []),
+            'rising_topics': report.get('rising_topics', []),
+            'format_trends': report.get('format_trends', []),
+            'ppl_observations': report.get('ppl_observations', ''),
+            'actionable_insights_for_hangoeun': report.get('actionable_insights_for_hangoeun', []),
+            'next_video_suggestions': report.get('next_video_suggestions', []),
+            'raw_data': report,
+        }).execute()
+        print(f"  💾 Supabase: weekly_reports 저장")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ weekly_reports 저장 실패: {e}")
+        return False
+
+
 def save_channel_insights(channel_insights):
     """채널 인사이트 저장"""
     client = get_client()
