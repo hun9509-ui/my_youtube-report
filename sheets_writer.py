@@ -1,9 +1,7 @@
 """
-구글 시트 저장 모듈 (Apps Script 웹훅)
-전략_스코어 탭은 gspread 직접 쓰기 사용
+구글 시트 저장 모듈 (gspread 직접 쓰기)
 """
 import os
-import requests
 import json
 import gspread
 from google.oauth2.service_account import Credentials
@@ -11,79 +9,94 @@ from datetime import datetime, timedelta
 import config
 
 
-_gspread_client = None
+_sh = None
 
-def _get_gspread_client():
-    global _gspread_client
-    if _gspread_client is not None:
-        return _gspread_client
+
+def _get_sheet():
+    """스프레드시트 객체 (세션 내 재사용)"""
+    global _sh
+    if _sh is not None:
+        return _sh
     creds_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
     if not creds_path:
-        print("  ⚠️ GOOGLE_APPLICATION_CREDENTIALS 미설정 — gspread 사용 불가")
+        print("  ⚠️ GOOGLE_APPLICATION_CREDENTIALS 미설정 — 시트 저장 불가")
         return None
     try:
-        scopes = [
+        creds = Credentials.from_service_account_file(creds_path, scopes=[
             'https://www.googleapis.com/auth/spreadsheets',
             'https://www.googleapis.com/auth/drive',
-        ]
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-        _gspread_client = gspread.authorize(creds)
-        return _gspread_client
+        ])
+        _sh = gspread.authorize(creds).open_by_key(config.GOOGLE_SHEET_ID)
+        return _sh
     except Exception as e:
-        print(f"  ⚠️ gspread 초기화 실패: {e}")
+        print(f"  ⚠️ 스프레드시트 초기화 실패: {e}")
         return None
 
 
-def call_webhook(action, data):
-    if not config.GOOGLE_WEBHOOK_URL:
-        print("⚠️ GOOGLE_WEBHOOK_URL이 설정되지 않음")
-        return None
-    payload = {"action": action, "data": data}
+def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int = None) -> int:
+    """탭에 행 추가. dedupe_col 지정 시 해당 컬럼 기준 중복 제거"""
+    if not rows:
+        return 0
+    sh = _get_sheet()
+    if not sh:
+        return 0
     try:
-        response = requests.post(config.GOOGLE_WEBHOOK_URL, json=payload, timeout=120)
-        if response.status_code == 200:
-            result = response.json()
-            if 'error' in result:
-                print(f"  ❌ 웹훅 오류 [{action}]: {result['error']}")
-                return None
-            return result
+        try:
+            ws = sh.worksheet(sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=sheet_name, rows=10000, cols=max(len(headers), 30))
+            ws.append_row(headers, value_input_option='USER_ENTERED')
+            existing = [headers]
         else:
-            print(f"  ❌ 웹훅 HTTP {response.status_code} [{action}]: {response.text[:300]}")
-            return None
+            existing = ws.get_all_values()
+            if not existing:
+                ws.append_row(headers, value_input_option='USER_ENTERED')
+                existing = [headers]
+
+        if dedupe_col is not None:
+            seen = {
+                row[dedupe_col]
+                for row in existing[1:]
+                if len(row) > dedupe_col and row[dedupe_col]
+            }
+            new_rows = [r for r in rows if len(r) > dedupe_col and str(r[dedupe_col]) not in seen]
+        else:
+            new_rows = rows
+
+        if not new_rows:
+            print(f"  ⏩ {sheet_name}: 신규 없음")
+            return 0
+
+        ws.append_rows(new_rows, value_input_option='USER_ENTERED')
+        print(f"  📊 {sheet_name}: {len(new_rows)}개 저장")
+        return len(new_rows)
     except Exception as e:
-        print(f"  ❌ 웹훅 호출 실패 [{action}]: {e}")
-        return None
+        print(f"  ⚠️ {sheet_name} 저장 실패: {e}")
+        return 0
 
 
 def save_videos(videos):
-    """영상 마스터 데이터 저장"""
     today = datetime.now().strftime('%Y-%m-%d')
-    rows = []
-    for v in videos:
-        rows.append([
-            today, v.get('channel_title', ''), v.get('video_id', ''),
-            v.get('title', ''), v.get('published_at', ''),
-            v.get('view_count', 0), v.get('like_count', 0), v.get('comment_count', 0),
-            v.get('duration', ''), str(v.get('tags', '')),
-            v.get('thumbnail_url', ''), v.get('video_url', ''),
-            v.get('description', '')[:200]
-        ])
-    result = call_webhook('save_videos', {
-        'sheet_name': config.SHEET_VIDEOS,
-        'rows': rows,
-        'headers': ['수집일', '채널명', '영상ID', '제목', '업로드일', '조회수', '좋아요',
-                    '댓글수', '영상길이', '태그', '썸네일URL', '영상URL', '설명'],
-        'dedupe_column': 2
-    })
-    return result.get('saved_count', 0) if result else 0
+    rows = [[
+        today, v.get('channel_title', ''), v.get('video_id', ''),
+        v.get('title', ''), v.get('published_at', ''),
+        v.get('view_count', 0), v.get('like_count', 0), v.get('comment_count', 0),
+        v.get('duration', ''), str(v.get('tags', '')),
+        v.get('thumbnail_url', ''), v.get('video_url', ''),
+        v.get('description', '')[:200],
+    ] for v in videos]
+    return _write_to_sheet(
+        config.SHEET_VIDEOS,
+        ['수집일', '채널명', '영상ID', '제목', '업로드일', '조회수', '좋아요',
+         '댓글수', '영상길이', '태그', '썸네일URL', '영상URL', '설명'],
+        rows, dedupe_col=2,
+    )
 
 
 def _build_analysis_row(a, extra_first_cols):
-    """분석 결과 1행 생성 (초기/일일 공통)"""
     gemini = a.get('gemini', {}) or {}
     comments = a.get('comments', {}) or {}
     sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
-
     return extra_first_cols + [
         a.get('video_id', ''),
         gemini.get('topic', ''),
@@ -125,36 +138,29 @@ _ANALYSIS_HEADERS_BASE = [
 
 
 def save_initial_analysis(analyses, batch_num):
-    """초기 분석 결과 저장 (배치별)"""
     today = datetime.now().strftime('%Y-%m-%d')
     rows = []
     for a in analyses:
         row = _build_analysis_row(a, [today, batch_num])
         row.append('대박' if a.get('is_hit') else '')
         rows.append(row)
-
-    result = call_webhook('save_initial', {
-        'sheet_name': config.SHEET_INITIAL,
-        'rows': rows,
-        'headers': ['분석일', '배치번호'] + _ANALYSIS_HEADERS_BASE + ['대박여부'],
-    })
-    return result.get('saved_count', 0) if result else 0
+    return _write_to_sheet(
+        config.SHEET_INITIAL,
+        ['분석일', '배치번호'] + _ANALYSIS_HEADERS_BASE + ['대박여부'],
+        rows,
+    )
 
 
 def save_daily_analysis(analyses):
-    """일일 분석 결과 저장 (날짜별)"""
     today = datetime.now().strftime('%Y-%m-%d')
     rows = [_build_analysis_row(a, [today]) for a in analyses]
-
-    result = call_webhook('save_daily', {
-        'sheet_name': config.SHEET_DAILY,
-        'rows': rows,
-        'headers': ['분석일'] + _ANALYSIS_HEADERS_BASE,
-    })
-    return result.get('saved_count', 0) if result else 0
+    return _write_to_sheet(
+        config.SHEET_DAILY,
+        ['분석일'] + _ANALYSIS_HEADERS_BASE,
+        rows,
+    )
 
 
-# 기존 호환성: save_analysis는 daily로 매핑
 def save_analysis(analyses):
     return save_daily_analysis(analyses)
 
@@ -171,15 +177,13 @@ def save_channel_insights(channel_insights):
             ', '.join(insights.get('winning_title_patterns', [])) if isinstance(insights.get('winning_title_patterns'), list) else '',
             ', '.join(insights.get('failure_patterns', [])) if isinstance(insights.get('failure_patterns'), list) else '',
             insights.get('differentiator', ''),
-            ', '.join(insights.get('lessons_for_hangoeun', [])) if isinstance(insights.get('lessons_for_hangoeun'), list) else ''
+            ', '.join(insights.get('lessons_for_hangoeun', [])) if isinstance(insights.get('lessons_for_hangoeun'), list) else '',
         ])
-    result = call_webhook('save_insights', {
-        'sheet_name': config.SHEET_CHANNEL_INSIGHTS,
-        'rows': rows,
-        'headers': ['분석일', '채널명', '성공공식', '잘되는주제', '성공제목패턴',
-                    '실패패턴', '차별점', '한고은적용포인트']
-    })
-    return result.get('saved_count', 0) if result else 0
+    return _write_to_sheet(
+        config.SHEET_CHANNEL_INSIGHTS,
+        ['분석일', '채널명', '성공공식', '잘되는주제', '성공제목패턴', '실패패턴', '차별점', '한고은적용포인트'],
+        rows,
+    )
 
 
 def save_daily_trends(trends_data):
@@ -188,14 +192,13 @@ def save_daily_trends(trends_data):
         today, trends_data.get('headline', ''),
         json.dumps(trends_data.get('top_5_keywords', []), ensure_ascii=False),
         json.dumps(trends_data.get('rising_topics', []), ensure_ascii=False),
-        trends_data.get('hangoeun_action', ''), trends_data.get('watch_out', '')
+        trends_data.get('hangoeun_action', ''), trends_data.get('watch_out', ''),
     ]
-    result = call_webhook('save_trends', {
-        'sheet_name': config.SHEET_TRENDS,
-        'rows': [row],
-        'headers': ['날짜', '핵심트렌드', '키워드', '떠오르는주제', '한고은적용아이디어', '주의영상']
-    })
-    return 1 if result else 0
+    return _write_to_sheet(
+        config.SHEET_TRENDS,
+        ['날짜', '핵심트렌드', '키워드', '떠오르는주제', '한고은적용아이디어', '주의영상'],
+        [row],
+    )
 
 
 def save_weekly_report(report):
@@ -207,34 +210,42 @@ def save_weekly_report(report):
         json.dumps(report.get('format_trends', []), ensure_ascii=False),
         report.get('ppl_observations', ''),
         json.dumps(report.get('actionable_insights_for_hangoeun', []), ensure_ascii=False),
-        json.dumps(report.get('next_video_suggestions', []), ensure_ascii=False)
+        json.dumps(report.get('next_video_suggestions', []), ensure_ascii=False),
     ]
-    result = call_webhook('save_weekly', {
-        'sheet_name': config.SHEET_WEEKLY,
-        'rows': [row],
-        'headers': ['날짜', '주간요약', '잘나가는채널', '떠오르는주제', '포맷트렌드',
-                    'PPL관찰', '한고은액션', '다음영상방향성']
-    })
-    return 1 if result else 0
+    return _write_to_sheet(
+        config.SHEET_WEEKLY,
+        ['날짜', '주간요약', '잘나가는채널', '떠오르는주제', '포맷트렌드', 'PPL관찰', '한고은액션', '다음영상방향성'],
+        [row],
+    )
 
 
 def get_videos_from_sheet(days_back=7):
-    cutoff = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
-    result = call_webhook('get_recent_videos', {
-        'sheet_name': config.SHEET_VIDEOS,
-        'cutoff_date': cutoff
-    })
-    if result and 'videos' in result:
-        return result['videos']
-    return []
+    """최근 N일 분석 영상 조회 (Supabase 직접)"""
+    import supabase_writer as db
+    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+    client = db.get_client()
+    if not client:
+        return []
+    try:
+        da = client.table('daily_analysis').select('video_id').gte('analysis_date', cutoff).execute()
+        ia = client.table('initial_analysis').select('video_id').gte('analysis_date', cutoff).execute()
+        video_ids = list({r['video_id'] for r in da.data + ia.data})
+        if not video_ids:
+            return []
+        vids = client.table('videos')\
+            .select('video_id,channel_title,title,view_count')\
+            .in_('video_id', video_ids).execute()
+        return [{'채널명': v['channel_title'], '제목': v['title'], '조회수': v['view_count']} for v in vids.data]
+    except Exception as e:
+        print(f"  ⚠️ 최근 영상 조회 실패: {e}")
+        return []
+
 
 def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
-    """자체 채널 새 영상 분석 저장"""
     today = datetime.now().strftime('%Y-%m-%d')
     g = gemini or {}
     c = comments or {}
     sentiment = c.get('sentiment', {}) if isinstance(c, dict) else {}
-
     row = [
         today,
         '숏츠' if video.get('video_type') == 'shorts' else '롱폼',
@@ -273,11 +284,9 @@ def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
         c.get('summary', ''),
         video.get('video_url', ''),
     ]
-
-    result = call_webhook('save_own_analysis', {
-        'sheet_name': config.SHEET_OWN_ANALYSIS,
-        'rows': [row],
-        'headers': [
+    return _write_to_sheet(
+        config.SHEET_OWN_ANALYSIS,
+        [
             '분석일', '유형', '영상ID', '제목', '업로드일', '조회수', '좋아요', '댓글수', '영상길이',
             '주제', '콘텐츠구조', '제목패턴', '제목감정톤', '후킹전략', 'PPL여부', 'PPL근거',
             '타겟층', '성과예측', '예측이유', '콘텐츠강점', '개선포인트', '썸네일제안', '경쟁사비교',
@@ -285,13 +294,11 @@ def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
             '신규시청자신호', '팬반응', '바이럴시그널', '재방문의사%', 'PPL반응', '크리에이터피드백',
             '댓글요약', 'URL',
         ],
-        'dedupe_column': 2,
-    })
-    return 1 if result else 0
+        [row], dedupe_col=2,
+    )
 
 
 def save_own_tracking(tracking_results: list) -> int:
-    """자체 채널 주별 추적 스냅샷 저장"""
     today = datetime.now().strftime('%Y-%m-%d')
     rows = []
     for r in tracking_results:
@@ -305,30 +312,16 @@ def save_own_tracking(tracking_results: list) -> int:
             r.get('view_count', 0),
             f"+{growth:,}" if growth >= 0 else f"{growth:,}",
         ])
-    if not rows:
-        return 0
-    result = call_webhook('save_own_tracking', {
-        'sheet_name': config.SHEET_OWN_TRACKING,
-        'rows': rows,
-        'headers': ['추적일', '주차', '유형', '제목', '업로드일', '누적조회수', '주간증가'],
-    })
-    return len(rows) if result else 0
+    return _write_to_sheet(
+        config.SHEET_OWN_TRACKING,
+        ['추적일', '주차', '유형', '제목', '업로드일', '누적조회수', '주간증가'],
+        rows,
+    )
 
 
 def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
-    """전략 스코어 시트 직접 저장 (gspread, 웹훅 미사용)"""
-    if not scores:
-        return 0
-
     today = datetime.now().strftime('%Y-%m-%d')
     vm = videos_map or {}
-    headers = [
-        '점수일', '버전', '출처', '채널명', '제목', '영상ID', '조회수', '업로드일',
-        '한고은적합도', '실행용이성', '반복가능성', '참신성', '리스크', 'PPL잠재력',
-        '트렌드수명', '지연리스크', '에버그린성', '수명타입',
-        '우선순위점수', '추천액션', '전략이유', 'URL',
-    ]
-
     rows = []
     for s in scores:
         vid = vm.get(s.get('video_id', ''), {})
@@ -356,46 +349,22 @@ def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
             s.get('strategy_reason', ''),
             vid.get('video_url', ''),
         ])
-
-    try:
-        gc = _get_gspread_client()
-        if not gc:
-            return 0
-
-        sh = gc.open_by_key(config.GOOGLE_SHEET_ID)
-        try:
-            ws = sh.worksheet(config.SHEET_SCORES)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=config.SHEET_SCORES, rows=5000, cols=len(headers))
-            ws.append_row(headers, value_input_option='USER_ENTERED')
-
-        existing = ws.get_all_values()
-        if not existing:
-            ws.append_row(headers, value_input_option='USER_ENTERED')
-            existing = [headers]
-
-        # 영상ID (col F, index 5) 기준 중복 제거
-        existing_ids = {row[5] for row in existing[1:] if len(row) > 5 and row[5]}
-        new_rows = [r for r in rows if r[5] not in existing_ids]
-
-        if not new_rows:
-            print(f"  ⏩ 전략_스코어: 신규 없음 ({len(existing_ids)}개 기존)")
-            return 0
-
-        ws.append_rows(new_rows, value_input_option='USER_ENTERED')
-        print(f"  📊 전략_스코어 시트: {len(new_rows)}개 저장 (gspread)")
-        return len(new_rows)
-
-    except Exception as e:
-        print(f"  ⚠️ 전략_스코어 시트 저장 실패 (gspread): {e}")
-        return 0
+    return _write_to_sheet(
+        config.SHEET_SCORES,
+        [
+            '점수일', '버전', '출처', '채널명', '제목', '영상ID', '조회수', '업로드일',
+            '한고은적합도', '실행용이성', '반복가능성', '참신성', '리스크', 'PPL잠재력',
+            '트렌드수명', '지연리스크', '에버그린성', '수명타입',
+            '우선순위점수', '추천액션', '전략이유', 'URL',
+        ],
+        rows, dedupe_col=5,
+    )
 
 
 def save_trend_classified(classified: dict) -> int:
-    """트렌드 분류 결과를 시트에 저장 (트랙 A/B/이레귤러 통합)"""
     today = datetime.now().strftime('%Y-%m-%d')
     rows = []
- 
+
     def _to_row(v, track):
         return [
             today, track, v.get('video_id', ''),
@@ -407,34 +376,28 @@ def save_trend_classified(classified: dict) -> int:
             ', '.join(v.get('irregular_reasons', [])) if isinstance(v.get('irregular_reasons'), list) else '',
             f"https://www.youtube.com/watch?v={v.get('video_id', '')}",
         ]
- 
+
     for v in classified.get('track_a', []):
         rows.append(_to_row(v, 'A'))
     for v in classified.get('track_b', []):
         rows.append(_to_row(v, 'B'))
     for v in classified.get('irregular', []):
         rows.append(_to_row(v, 'IRREGULAR'))
- 
-    if not rows:
-        return 0
- 
-    result = call_webhook('save_trends_v2', {
-        'sheet_name': config.SHEET_TRENDS,
-        'rows': rows,
-        'headers': ['날짜', '트랙', '영상ID', '제목', '채널명',
-                    '조회수', '좋아요', '댓글수', '업로드일',
-                    '트랙A점수', '트랙B점수', '매칭키워드', '이레귤러사유', 'URL']
-    })
- 
-    # 사건 키워드는 별도 시트에 저장 (선택)
+
+    saved = _write_to_sheet(
+        config.SHEET_TRENDS,
+        ['날짜', '트랙', '영상ID', '제목', '채널명',
+         '조회수', '좋아요', '댓글수', '업로드일',
+         '트랙A점수', '트랙B점수', '매칭키워드', '이레귤러사유', 'URL'],
+        rows,
+    )
+
     event_kws = classified.get('event_keywords', [])
     if event_kws:
-        call_webhook('save_event_keywords', {
-            'sheet_name': config.SHEET_EVENT_KEYWORDS,
-            'rows': [[today, ', '.join(event_kws)]],
-            'headers': ['날짜', '사건키워드']
-        })
- 
-    return len(rows)
- 
- 
+        _write_to_sheet(
+            config.SHEET_EVENT_KEYWORDS,
+            ['날짜', '사건키워드'],
+            [[today, ', '.join(event_kws)]],
+        )
+
+    return saved

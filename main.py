@@ -38,7 +38,6 @@ required = {
     'DEEPSEEK_API_KEY':   config.DEEPSEEK_API_KEY,
     'TELEGRAM_BOT_TOKEN': config.TELEGRAM_BOT_TOKEN,
     'TELEGRAM_CHAT_ID':   config.TELEGRAM_CHAT_ID,
-    'GOOGLE_WEBHOOK_URL': config.GOOGLE_WEBHOOK_URL,
 }
 missing = [k for k, v in required.items() if not v]
 if missing:
