@@ -116,8 +116,8 @@ def save_initial_analysis(analyses, batch_num):
             'complaints': comments.get('complaints', []),
             'suggestions': comments.get('suggestions', []),
             'comments_summary': comments.get('summary', ''),
-            'gemini_raw': gemini,
-            'deepseek_raw': comments,
+            'gemini_raw': {**gemini, '_version': config.ANALYSIS_VERSION},
+            'deepseek_raw': {**comments, '_version': config.ANALYSIS_VERSION},
             'is_hit': a.get('is_hit', False),
             'channel_avg_views': a.get('channel_avg_views', 0),
         })
@@ -167,10 +167,10 @@ def save_daily_analysis(analyses):
             'complaints': comments.get('complaints', []),
             'suggestions': comments.get('suggestions', []),
             'comments_summary': comments.get('summary', ''),
-            'gemini_raw': gemini,
-            'deepseek_raw': comments,
+            'gemini_raw': {**gemini, '_version': config.ANALYSIS_VERSION},
+            'deepseek_raw': {**comments, '_version': config.ANALYSIS_VERSION},
         })
-    
+
     try:
         result = client.table('daily_analysis').insert(rows).execute()
         print(f"  💾 Supabase: daily_analysis {len(rows)}개 저장")
@@ -275,12 +275,12 @@ def save_trend_classified(classified: dict) -> int:
 # ───────────────────────────────────────────────
 
 def is_own_video_analyzed(video_id: str) -> bool:
-    """이미 수집된 자체 채널 영상인지 확인"""
+    """분석까지 완료된 자체 채널 영상인지 확인 (own_channel_analysis 기준)"""
     client = get_client()
     if not client:
         return False
     try:
-        result = client.table('own_channel_videos').select('video_id').eq('video_id', video_id).execute()
+        result = client.table('own_channel_analysis').select('video_id').eq('video_id', video_id).execute()
         return len(result.data) > 0
     except Exception:
         return False
@@ -349,8 +349,8 @@ def save_own_analysis(video_id: str, gemini_result: dict, comments_result: dict)
             'ppl_reaction': comments.get('ppl_reaction', ''),
             'creator_feedback': comments.get('creator_feedback', ''),
             'comments_summary': comments.get('summary', ''),
-            'gemini_raw': gemini,
-            'deepseek_raw': comments,
+            'gemini_raw': {**gemini, '_version': config.ANALYSIS_VERSION},
+            'deepseek_raw': {**comments, '_version': config.ANALYSIS_VERSION},
         }).execute()
         print(f"  💾 Supabase: own_channel_analysis 저장 ({video_id[:8]}...)")
     except Exception as e:
@@ -412,6 +412,20 @@ def get_last_snapshot(video_id: str) -> dict | None:
         return None
 
 
+def get_snapshot_by_week(video_id: str, week_number: int) -> dict | None:
+    """특정 주차 스냅샷 조회 (중복 저장 방지용)"""
+    client = get_client()
+    if not client:
+        return None
+    try:
+        result = client.table('own_channel_snapshots').select('id')\
+            .eq('video_id', video_id).eq('week_number', week_number).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        print(f"  ⚠️ 주차 스냅샷 조회 실패: {e}")
+        return None
+
+
 def save_own_snapshot(video_id: str, week_number: int, current_stats: dict,
                       prev_view_count: int, comment_analysis: dict = None):
     """주별 스냅샷 저장"""
@@ -463,6 +477,135 @@ def deactivate_tracking(video_id: str):
         print(f"  ✅ 추적 종료: {video_id[:8]}... (5주 완료)")
     except Exception as e:
         print(f"  ⚠️ 추적 비활성화 실패: {e}")
+
+
+# ───────────────────────────────────────────────
+# 전략 스코어링
+# ───────────────────────────────────────────────
+
+def save_video_scores(scores: list) -> int:
+    """전략 스코어 저장 (video_id + score_version 기준 upsert)"""
+    client = get_client()
+    if not client:
+        return 0
+
+    today = datetime.now().date().isoformat()
+    rows = []
+    for s in scores:
+        rows.append({
+            'video_id':             s.get('video_id', ''),
+            'scored_at':            today,
+            'score_version':        s.get('score_version', config.SCORE_VERSION),
+            'source_table':         s.get('source_table', ''),
+            'hangoeun_fit_score':   s.get('hangoeun_fit_score'),
+            'execution_score':      s.get('execution_score'),
+            'repeatability_score':  s.get('repeatability_score'),
+            'novelty_score':        s.get('novelty_score'),
+            'risk_score':           s.get('risk_score'),
+            'ppl_potential_score':  s.get('ppl_potential_score'),
+            'trend_lifespan_score': s.get('trend_lifespan_score'),
+            'upload_delay_risk':    s.get('upload_delay_risk'),
+            'evergreen_score':      s.get('evergreen_score'),
+            'content_lifespan_type': s.get('content_lifespan_type'),
+            'priority_score':       s.get('priority_score'),
+            'recommended_action':   s.get('recommended_action'),
+            'strategy_reason':      s.get('strategy_reason'),
+            'rule_trace':           s.get('rule_trace'),
+        })
+
+    if not rows:
+        return 0
+
+    try:
+        client.table('video_scores').upsert(
+            rows, on_conflict='video_id,score_version'
+        ).execute()
+        print(f"  💾 Supabase: video_scores {len(rows)}개 저장")
+        return len(rows)
+    except Exception as e:
+        print(f"  ⚠️ video_scores 저장 실패: {e}")
+        return 0
+
+
+def get_score_backfill_rows() -> tuple:
+    """
+    스코어 백필용 데이터 조회
+    Returns: (initial_rows, daily_rows)
+      각각 [(video_dict, analysis_dict), ...] 형태
+    이미 현재 score_version으로 점수화된 video_id는 제외
+    """
+    client = get_client()
+    if not client:
+        return [], []
+
+    try:
+        # 이미 스코어링 완료된 video_id 집합
+        scored = client.table('video_scores').select('video_id')\
+            .eq('score_version', config.SCORE_VERSION).execute()
+        scored_ids = {r['video_id'] for r in scored.data}
+
+        # videos 전체 맵 (video_id → dict)
+        vids = client.table('videos').select('*').execute()
+        videos_map = {v['video_id']: v for v in vids.data}
+
+        # initial_analysis
+        ia = client.table('initial_analysis').select('*').execute()
+        initial_rows = [
+            (videos_map.get(r.get('video_id', ''), {}), r)
+            for r in ia.data
+            if r.get('video_id') not in scored_ids
+        ]
+
+        # daily_analysis (video_id 중복 제거 — 최신 1건만)
+        da = client.table('daily_analysis').select('*')\
+            .order('analysis_date', desc=True).execute()
+        seen = set()
+        daily_rows = []
+        for r in da.data:
+            vid = r.get('video_id', '')
+            if vid in scored_ids or vid in seen:
+                continue
+            seen.add(vid)
+            daily_rows.append((videos_map.get(vid, {}), r))
+
+        print(f"  📋 백필 대상: initial {len(initial_rows)}개 / daily {len(daily_rows)}개")
+        return initial_rows, daily_rows
+
+    except Exception as e:
+        print(f"  ⚠️ 백필 데이터 조회 실패: {e}")
+        return [], []
+
+
+def get_top_priority_videos(limit: int = 5, days_back: int = 7) -> list:
+    """priority_score 상위 N개 조회 (videos 조인)"""
+    client = get_client()
+    if not client:
+        return []
+
+    try:
+        result = client.table('video_scores').select('*')\
+            .eq('score_version', config.SCORE_VERSION)\
+            .order('priority_score', desc=True)\
+            .limit(limit).execute()
+
+        if not result.data:
+            return []
+
+        video_ids = [r['video_id'] for r in result.data]
+        vid_res = client.table('videos')\
+            .select('video_id,title,channel_title,video_url,view_count,published_at')\
+            .in_('video_id', video_ids).execute()
+        vid_map = {v['video_id']: v for v in vid_res.data}
+
+        merged = []
+        for s in result.data:
+            vid = vid_map.get(s['video_id'], {})
+            merged.append({**s, **vid})
+        return merged
+
+    except Exception as e:
+        print(f"  ⚠️ top priority 조회 실패: {e}")
+        return []
 
 
 def get_weekly_trend_summary(days_back: int = 7) -> dict:

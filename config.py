@@ -49,6 +49,10 @@ OWN_CHANNEL = "고은언니 한고은"
 OWN_CHANNEL_ID = "UCPFW9tE-hAuyR4037csZAqg"
 OWN_CHANNEL_TRACKING_WEEKS = 5  # 업로드 후 5주 월요일까지 추적
 
+# ===== 분석 버전 =====
+ANALYSIS_VERSION = "1.1"  # 프롬프트/모델 기준 버전 (데이터 추적용)
+SCORE_VERSION = "v1.2"    # 전략 스코어링 버전
+
 # ===== 분석 설정 =====
 INITIAL_MONTHS = 6
 TOP_COMMENTS_COUNT = 200
@@ -82,6 +86,7 @@ SHEET_EVENT_KEYWORDS = "일일_사건키워드"
 SHEET_WEEKLY = "주간_리포트"
 SHEET_OWN_ANALYSIS = "자체채널_분석"
 SHEET_OWN_TRACKING = "자체채널_추적"
+SHEET_SCORES = "전략_스코어"
 
 # 기존 호환성 유지
 SHEET_ANALYSIS = SHEET_DAILY  # 기존 코드 호환

@@ -288,6 +288,56 @@ def save_own_tracking(tracking_results: list) -> int:
     return len(rows) if result else 0
 
 
+def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
+    """전략 스코어 시트 저장 (전략_스코어 탭)"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    vm = videos_map or {}
+    rows = []
+
+    for s in scores:
+        vid = vm.get(s.get('video_id', ''), {})
+        rows.append([
+            today,
+            s.get('score_version', ''),
+            s.get('source_table', ''),
+            vid.get('channel_title', ''),
+            vid.get('title', ''),
+            s.get('video_id', ''),
+            vid.get('view_count', 0),
+            str(vid.get('published_at', ''))[:10],
+            s.get('hangoeun_fit_score', 0),
+            s.get('execution_score', 0),
+            s.get('repeatability_score', 0),
+            s.get('novelty_score', 0),
+            s.get('risk_score', 0),
+            s.get('ppl_potential_score', 0),
+            s.get('trend_lifespan_score', 0),
+            s.get('upload_delay_risk', 0),
+            s.get('evergreen_score', 0),
+            s.get('content_lifespan_type', ''),
+            s.get('priority_score', 0),
+            s.get('recommended_action', ''),
+            s.get('strategy_reason', ''),
+            vid.get('video_url', ''),
+        ])
+
+    if not rows:
+        return 0
+
+    result = call_webhook('save_strategy_scores', {
+        'sheet_name': config.SHEET_SCORES,
+        'rows': rows,
+        'headers': [
+            '점수일', '버전', '출처', '채널명', '제목', '영상ID', '조회수', '업로드일',
+            '한고은적합도', '실행용이성', '반복가능성', '참신성', '리스크', 'PPL잠재력',
+            '트렌드수명', '지연리스크', '에버그린성', '수명타입',
+            '우선순위점수', '추천액션', '전략이유', 'URL',
+        ],
+        'dedupe_column': 5,
+    })
+    return result.get('saved_count', 0) if result else 0
+
+
 def save_trend_classified(classified: dict) -> int:
     """트렌드 분류 결과를 시트에 저장 (트랙 A/B/이레귤러 통합)"""
     today = datetime.now().strftime('%Y-%m-%d')

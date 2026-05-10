@@ -64,7 +64,7 @@ def send_daily_trend_alert(trend_summary):
     return send_message(message.strip())
 
 
-def send_weekly_report_alert(report):
+def send_weekly_report_alert(report, top_priority=None):
     """주간 리포트 알림 (매주 월요일 오전 10시)"""
     if 'error' in report:
         return send_message(f"⚠️ 주간 리포트 생성 실패: {report['error']}")
@@ -81,6 +81,19 @@ def send_weekly_report_alert(report):
     top_channels = report.get('top_performing_channels', [])
     top_channels_text = "\n".join([f"  • {c}" for c in top_channels[:3]]) if isinstance(top_channels, list) else str(top_channels)
     
+    top5_text = ""
+    if top_priority:
+        top5_text = "\n\n⭐ <b>이번 주 기획 우선순위 TOP 5</b>\n"
+        for i, v in enumerate(top_priority[:5], 1):
+            title = v.get('title', '')[:35]
+            channel = v.get('channel_title', '')
+            score = v.get('priority_score', 0)
+            action = v.get('recommended_action', '')
+            reason = v.get('strategy_reason', '')[:80]
+            top5_text += f"  {i}. [{channel}] {title} — {score}점 | {action}\n"
+            if reason:
+                top5_text += f"     → {reason}\n"
+
     message = f"""
 📊 <b>주간 경쟁 채널 리포트</b>
 ━━━━━━━━━━━━━━━━━━
@@ -104,8 +117,7 @@ def send_weekly_report_alert(report):
 {insights_text}
 
 🎯 <b>다음 영상 방향성</b>
-{suggestions_text}
-
+{suggestions_text}{top5_text}
 ━━━━━━━━━━━━━━━━━━
 📊 전체 데이터는 구글 시트에서 확인
 """

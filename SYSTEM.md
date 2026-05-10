@@ -1,6 +1,6 @@
 # 한고은 채널 분석 시스템
 
-> **현재 버전**: v1.0 (2026-05-10)  
+> **현재 버전**: v1.2 (2026-05-10)  
 > **목적**: 경쟁 채널 10개 + 자체 채널 자동 분석 → 콘텐츠 전략 인사이트 도출
 
 ---
@@ -250,12 +250,15 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 - **중간 저장**: 10개 영상마다 저장 → 장시간 실행 중 장애 시 손실 최소화
 - **Gemini 모델**: `gemini-2.5-flash` (Vertex AI, us-central1, GCP 서비스 계정 인증)
 - **DeepSeek 모델**: 단순 작업 → `deepseek-v4-flash` / 복잡 작업 → `deepseek-v4-pro`
+- **분석 버전 추적**: `config.ANALYSIS_VERSION`을 `gemini_raw._version` / `deepseek_raw._version` JSONB 필드에 자동 삽입 → 프롬프트/모델 변경 시 데이터 계보 추적 가능
 
 ### 자체 채널 추적 규칙
 - 업로드 감지: 매일 KST 01:00 자동 실행, 최근 7일 신규 영상 확인
-- 추적: 업로드 후 매주 월요일 스냅샷, 5회 후 자동 종료
+- 추적: `published_at` 기준 주차 계산 (`days_elapsed // 7 + 1`), 매주 월요일 스냅샷, 5주차 완료 후 자동 종료
+- 중복 방지: `get_snapshot_by_week(video_id, week_number)` — 이미 저장된 주차면 skip
 - 댓글 분석: 1주·2주·5주차만 실행 (API 절약)
 - 숏츠 판별: `#shorts` 태그 또는 60초 이하
+- 신규 영상 판별: `own_channel_analysis` 테이블 기준 (Gemini+DeepSeek 분석 완료 여부)
 
 ### 배치 재실행 시
 ```
@@ -280,10 +283,44 @@ GitHub Actions → initial-batch.yml → Run workflow → 배치 번호 선택
 | Gemini JSON 파싱 실패 | 응답이 마크다운 코드블록으로 감싸짐 | `_extract_json()` regex 파싱 함수 |
 | 구글 시트 탭 미생성 | Apps Script 재배포 누락 | 코드 수정 후 반드시 새 버전 재배포 |
 | 배치 재실행 중복 | 기존 데이터 남아있음 | `delete_initial_batch()` 자동 삭제 |
+| 자체채널 재실행 시 "새 영상 없음" | `is_own_video_analyzed()`가 `own_channel_videos` 존재만 확인 → 분석 실패 시 스킵 | `own_channel_analysis` 테이블 기준으로 변경 |
+| PPL 항상 true 출력 | Gemini 프롬프트에 `"ppl_likely": true` 하드코딩 | 설명 문자열 `"PPL 가능성 있으면 true, 없으면 false"`로 교체 |
+| 자체채널 추적 주차 오류 | snapshot count 기반 → 재실행 시 이미 완료한 주차 덮어쓸 위험 | `published_at` 기준 주차 계산 + `get_snapshot_by_week()` 중복 방지 |
 
 ---
 
 ## 버전 히스토리
+
+### v1.2 (2026-05-10) — 전략 스코어링 시스템 추가
+**Major**
+- `strategy_scorer.py` 신규: 룰 기반 전략 점수 산출 (API 호출 없음, 결정론적)
+- 13개 산출 항목: hangoeun_fit / execution / repeatability / novelty / risk / ppl_potential / trend_lifespan / upload_delay_risk / evergreen / content_lifespan_type / priority_score / recommended_action / strategy_reason
+- `rule_trace` JSONB로 각 점수 산출 근거 저장
+- `score_version` 관리로 룰 개정 시 버전별 재스코어링 지원
+- Supabase `video_scores` 테이블 신규 (`UNIQUE(video_id, score_version)`)
+- 구글 시트 `전략_스코어` 탭 신규
+- `python main.py score-backfill`: 기존 6개월 분석 데이터 일괄 후처리
+- `score-backfill.yml` GitHub Actions workflow_dispatch 추가
+- daily/initial 분석 완료 후 자동 스코어링 연결 (분석 실패와 독립)
+- 주간 리포트 텔레그램 알림 하단에 기획 우선순위 TOP5 섹션 추가
+
+**priority_score 공식**
+```
+hangoeun_fit×0.30 + repeatability×0.18 + evergreen×0.15
++ novelty×0.12 + ppl_potential×0.10 + trend_lifespan×0.08
++ execution×0.07 − risk×0.15 − upload_delay_risk×0.10
+```
+
+---
+
+### v1.1 (2026-05-10) — 버그 수정 패치
+**Fixed**
+- `is_own_video_analyzed()`: `own_channel_videos` → `own_channel_analysis` 기준으로 변경 (분석 실패 시 재시도 가능)
+- Gemini 프롬프트 PPL 하드코딩 제거: 경쟁채널/자체채널 양쪽 `"ppl_likely": true` → 설명 문자열로 교체
+- 분석 버전 태깅: `gemini_raw._version` / `deepseek_raw._version` 필드에 `ANALYSIS_VERSION` 자동 삽입
+- 자체채널 추적 주차 계산: snapshot count 기반 → `published_at` 기준 실제 주차 계산 + `get_snapshot_by_week()` 중복 방지
+
+---
 
 ### v1.0 (2026-05-10) — 초기 릴리스
 **Major**

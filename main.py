@@ -29,6 +29,7 @@ import sheets_writer as sheets; print("  ✓ sheets_writer", flush=True)
 import supabase_writer as db;   print("  ✓ supabase_writer", flush=True)
 import telegram_notifier as tg; print("  ✓ telegram_notifier", flush=True)
 import trend_classifier as tc;  print("  ✓ trend_classifier", flush=True)
+import strategy_scorer as scorer; print("  ✓ strategy_scorer", flush=True)
 
 # ── 환경변수 체크 ──────────────────────────────
 print("\n⏳ 환경변수 체크 중...", flush=True)
@@ -116,6 +117,21 @@ def _save_analyses(analyses: list[dict], mode: str, batch_num: int = 0):
     else:
         sheets.save_daily_analysis(analyses)
         db.save_daily_analysis(analyses)
+
+
+def _score_and_save(analyses: list[dict], videos_list: list[dict], source_table: str):
+    """분석 완료 후 전략 스코어 자동 생성 — 실패해도 분석 저장은 영향 없음"""
+    try:
+        videos_map = {v.get('video_id'): v for v in videos_list}
+        scores = scorer.score_batch(videos_map, analyses, source_table)
+        if not scores:
+            return
+        db.save_video_scores(scores)
+        sheets.save_strategy_scores(scores, videos_map)
+        print(f"  📊 전략 스코어 {len(scores)}개 저장")
+    except Exception as e:
+        print(f"  ⚠️ 전략 스코어링 실패 (분석은 정상 저장됨): {e}")
+        tg.send_error_alert(str(e), "전략 스코어링")
 
 
 # ───────────────────────────────────────────────
@@ -241,6 +257,9 @@ def run_initial_batch(batch_num: int):
     sheets.save_channel_insights(insights)
     db.save_channel_insights(insights)
 
+    print(f"\n📊 전략 스코어링")
+    _score_and_save(all_analyses, all_videos, 'initial_analysis')
+
     duration = time.time() - start
     tg.send_message(
         f"✅ <b>배치#{batch_num} 완료</b>\n\n"
@@ -302,6 +321,7 @@ def run_daily_collection():
         stats["analyzed"] += 1
 
     _save_analyses(analyses, "daily")
+    _score_and_save(analyses, all_new, 'daily_analysis')
 
     duration = time.time() - start
     tg.send_message(
@@ -482,6 +502,79 @@ def run_own_channel_daily():
 # 모드 6: 자체 채널 주간 추적 (매주 월요일)
 # ───────────────────────────────────────────────
 
+def _calculate_week_number(published_at_str: str) -> int:
+    """업로드일 기준 현재 주차 (7일마다 +1주, 최소 1주)"""
+    if not published_at_str:
+        return 0
+    try:
+        published = datetime.fromisoformat(published_at_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        days_elapsed = (now - published).days
+        return (days_elapsed // 7) + 1
+    except Exception:
+        return 0
+
+
+def run_score_backfill():
+    """기존 initial/daily 분석 데이터 전체에 전략 스코어 후처리 저장"""
+    print(f"📊 전략 스코어 백필 시작 ({datetime.now()})")
+    start = time.time()
+
+    initial_rows, daily_rows = db.get_score_backfill_rows()
+    total = len(initial_rows) + len(daily_rows)
+
+    if total == 0:
+        print("📭 백필할 데이터 없음 (이미 모두 스코어링됨)")
+        tg.send_message(f"📊 전략 스코어 백필: 처리할 데이터 없음 ({config.SCORE_VERSION})")
+        return
+
+    all_scores = []
+    all_videos_map = {}
+
+    for video, analysis in initial_rows:
+        try:
+            score = scorer.score_video(video, analysis, 'initial_analysis')
+            all_scores.append(score)
+            if video.get('video_id'):
+                all_videos_map[video['video_id']] = video
+        except Exception as e:
+            print(f"  ⚠️ 스코어링 실패 ({analysis.get('video_id', '')}): {e}")
+
+    for video, analysis in daily_rows:
+        try:
+            score = scorer.score_video(video, analysis, 'daily_analysis')
+            all_scores.append(score)
+            if video.get('video_id'):
+                all_videos_map[video['video_id']] = video
+        except Exception as e:
+            print(f"  ⚠️ 스코어링 실패 ({analysis.get('video_id', '')}): {e}")
+
+    if not all_scores:
+        print("⚠️ 스코어링 결과 없음")
+        tg.send_error_alert("스코어링 결과가 비어 있습니다.", "score-backfill")
+        return
+
+    db.save_video_scores(all_scores)
+    sheets.save_strategy_scores(all_scores, all_videos_map)
+
+    action_counts = {}
+    for s in all_scores:
+        a = s.get('recommended_action', '')
+        action_counts[a] = action_counts.get(a, 0) + 1
+
+    duration = time.time() - start
+    tg.send_message(
+        f"📊 <b>전략 스코어 백필 완료</b>\n\n"
+        f"📺 처리: {len(all_scores)}개\n"
+        f"  ⭐ 바로 기획화: {action_counts.get('바로 기획화', 0)}개\n"
+        f"  ✏️ 각색 후 기획: {action_counts.get('각색 후 기획', 0)}개\n"
+        f"  📦 아이디어 보관: {action_counts.get('아이디어 보관', 0)}개\n"
+        f"  ▽ 우선순위 낮음: {action_counts.get('우선순위 낮음', 0)}개\n"
+        f"⏱️ 소요: {duration:.0f}초"
+    )
+    print(f"✅ 백필 완료 ({len(all_scores)}개, {duration:.0f}초)")
+
+
 def run_own_channel_backfill():
     """Supabase에 저장된 자체 채널 분석 결과 → 구글 시트 재저장"""
     print(f"📦 자체 채널 백필 시작")
@@ -513,7 +606,7 @@ def run_own_channel_backfill():
 
 
 def run_own_channel_track():
-    """매주 월요일 - 업로드 후 5주까지 스냅샷 추적"""
+    """매주 월요일 - 업로드일 기준 주차로 5주까지 스냅샷 추적"""
     print(f"📊 자체 채널 추적 시작 ({datetime.now()})")
     start = time.time()
 
@@ -529,13 +622,21 @@ def run_own_channel_track():
     for tracked in tracking_videos:
         video_id = tracked['video_id']
         try:
-            snap_count = db.count_snapshots(video_id)
+            # published_at 기준으로 현재 주차 계산
+            week_number = _calculate_week_number(str(tracked.get('published_at', '')))
 
-            if snap_count >= config.OWN_CHANNEL_TRACKING_WEEKS:
+            if week_number < 1:
+                print(f"  ⏩ 아직 1주 미만: {tracked['title'][:30]}")
+                continue
+
+            if week_number > config.OWN_CHANNEL_TRACKING_WEEKS:
                 db.deactivate_tracking(video_id)
                 continue
 
-            week_number = snap_count + 1
+            # 이번 주차 스냅샷이 이미 있으면 skip (중복 방지)
+            if db.get_snapshot_by_week(video_id, week_number):
+                print(f"  ⏩ 주차{week_number} 이미 저장: {tracked['title'][:30]}")
+                continue
 
             details = yt.get_video_details([video_id], min_duration=0)
             if not details:
@@ -617,7 +718,8 @@ def run_weekly_report():
 
         report = ds.generate_weekly_report(insights, top)
         sheets.save_weekly_report(report)
-        tg.send_weekly_report_alert(report)
+        top_priority = db.get_top_priority_videos(limit=5, days_back=7)
+        tg.send_weekly_report_alert(report, top_priority)
         print("✅ 주간 채널 리포트 완료")
     except Exception as e:
         print(f"❌ 주간 리포트 오류: {e}")
@@ -659,6 +761,8 @@ if __name__ == "__main__":
         run_own_channel_track()
     elif mode == "own-backfill":
         run_own_channel_backfill()
+    elif mode == "score-backfill":
+        run_score_backfill()
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")
