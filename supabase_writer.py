@@ -642,22 +642,33 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
     cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
  
     try:
-        # 트랙별 TOP 영상 (조회수 순)
-        track_a = client.table('trend_classified') \
+        # 트랙별 TOP 영상 — 많이 가져와서 video_id 기준 중복 제거 후 TOP 10
+        track_a_raw = client.table('trend_classified') \
             .select('*') \
             .eq('track', 'A') \
             .gte('analysis_date', cutoff) \
             .order('view_count', desc=True) \
-            .limit(10) \
+            .limit(100) \
             .execute()
- 
-        track_b = client.table('trend_classified') \
+
+        track_b_raw = client.table('trend_classified') \
             .select('*') \
             .eq('track', 'B') \
             .gte('analysis_date', cutoff) \
             .order('view_count', desc=True) \
-            .limit(10) \
+            .limit(100) \
             .execute()
+
+        def dedup_by_video_id(rows, top_n=10):
+            seen = {}
+            for row in rows:
+                vid = row.get('video_id')
+                if vid not in seen or row.get('view_count', 0) > seen[vid].get('view_count', 0):
+                    seen[vid] = row
+            return sorted(seen.values(), key=lambda x: x.get('view_count', 0), reverse=True)[:top_n]
+
+        track_a_data = dedup_by_video_id(track_a_raw.data)
+        track_b_data = dedup_by_video_id(track_b_raw.data)
  
         # 이번 주 사건 키워드 빈도 합산
         kw_data = client.table('event_keywords') \
@@ -674,8 +685,8 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
         top_keywords = [k for k, _ in kw_counter.most_common(10)]
  
         return {
-            'track_a': track_a.data,
-            'track_b': track_b.data,
+            'track_a': track_a_data,
+            'track_b': track_b_data,
             'event_keywords': top_keywords,
             'period_days': days_back,
         }
