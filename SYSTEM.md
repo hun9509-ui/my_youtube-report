@@ -1,6 +1,6 @@
 # 한고은 채널 분석 시스템
 
-> **현재 버전**: v1.2 (2026-05-11)  
+> **현재 버전**: v1.4 (2026-05-11)  
 > **목적**: 경쟁 채널 10개 + 자체 채널 자동 분석 → 콘텐츠 전략 인사이트 도출
 
 ---
@@ -107,6 +107,7 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `python main.py own-backfill` | Supabase → 구글 시트 재동기화 |
 | `python main.py score-backfill` | 기존 분석 전체에 전략 스코어 소급 산출 |
 | `python main.py score-sheets-sync` | Supabase 스코어 → 구글 시트 동기화 |
+| `python main.py stats-refresh` | 경쟁채널 전체 영상 조회수·좋아요·댓글수 갱신 |
 
 ### GitHub Actions 자동화 스케줄
 
@@ -120,6 +121,7 @@ youtube_collector.py  ←── 영상 수집 (search.list 금지, playlistItems
 | `own-channel-track.yml` | 월요일 12:00 | `own-track` |
 | `score-backfill.yml` | 수동 실행 | `score-backfill` |
 | `score-sheets-sync.yml` | 수동 실행 | `score-sheets-sync` |
+| `stats-refresh.yml` | 매일 09:00 | `stats-refresh` |
 
 ---
 
@@ -339,6 +341,31 @@ hangoeun_fit×0.30 + repeatability×0.18 + evergreen×0.15
 + novelty×0.12 + ppl_potential×0.10 + trend_lifespan×0.08
 + execution×0.07 − risk×0.15 − upload_delay_risk×0.10
 ```
+
+---
+
+### v1.4 (2026-05-11) — 시계열 스냅샷 + 썸네일 Vision 분석
+**Added**
+- `video_snapshots` Supabase 테이블: 경쟁채널 + 자체채널 전 영상 일별 시계열 스냅샷 (view/like/comment growth 포함)
+- `thumbnail_analysis` Supabase 테이블: 썸네일 Vision 분석 결과 (face_count, main_emotion, CTR 예측 등 14개 필드)
+- `snapshot-collect` 모드: stats-refresh 대체. YouTube API 수집 + `video_snapshots` 저장 통합 (매일 KST 09:00)
+- `thumbnail-backfill` 모드: HIT + IRREGULAR + priority_score≥70 영상 썸네일을 Gemini 2.5 Pro로 분석
+- `thumbnail-backfill.yml` 워크플로우 (수동 실행)
+- `stats-refresh.yml` → `snapshot-collect` 실행으로 업그레이드
+
+**Changed**
+- `get_gemini_model('vision')` → `gemini-2.5-pro` 추가
+
+---
+
+### v1.3 (2026-05-11) — 통계 갱신 파이프라인 추가
+**Added**
+- `stats-refresh` 실행 모드: 경쟁채널 전체 영상 조회수·좋아요·댓글수 일괄 갱신 (AI 없음, YouTube API만)
+- `stats-refresh.yml`: 매일 KST 09:00 자동 실행 (주간보고 전 stats 선행 갱신)
+- `get_all_tracked_video_ids()` / `get_recent_videos_from_db()` in supabase_writer.py
+
+**Changed**
+- `run_weekly_report()`: 구글 시트(stale) → Supabase(최신 stats) 기준으로 변경. Supabase 없을 시 시트 fallback
 
 ---
 

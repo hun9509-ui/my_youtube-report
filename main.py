@@ -725,20 +725,194 @@ def run_own_channel_track():
 
 
 # ───────────────────────────────────────────────
-# 모드 7: 주간 채널 리포트 (기존)
+# 모드 7: 스냅샷 수집 (매일 — AI 없음)
+# ───────────────────────────────────────────────
+
+def _build_snapshot(video_meta: dict, fresh: dict, prev: dict | None, today: str) -> dict:
+    """영상 1개 스냅샷 row 생성"""
+    try:
+        pub = datetime.fromisoformat(
+            str(video_meta.get('published_at', '')).replace('Z', '+00:00')
+        )
+        days_since = (datetime.now(timezone.utc) - pub).days
+    except Exception:
+        days_since = 0
+
+    view_now  = fresh.get('view_count', 0)
+    like_now  = fresh.get('like_count', 0)
+    comm_now  = fresh.get('comment_count', 0)
+
+    prev_view = prev['view_count']  if prev else 0
+    prev_like = prev['like_count']  if prev else 0
+    prev_comm = prev['comment_count'] if prev else 0
+
+    view_growth = view_now - prev_view
+    like_growth = like_now - prev_like
+    comm_growth = comm_now - prev_comm
+
+    view_growth_rate = round(view_growth / prev_view * 100, 2) if prev_view else 0
+    comm_growth_rate = round(comm_growth / prev_comm * 100, 2) if prev_comm else 0
+
+    return {
+        'video_id':          fresh['video_id'],
+        'channel_title':     fresh.get('channel_title') or video_meta.get('channel_title', ''),
+        'snapshot_date':     today,
+        'days_since_publish': days_since,
+        'view_count':        view_now,
+        'like_count':        like_now,
+        'comment_count':     comm_now,
+        'view_growth':       view_growth,
+        'like_growth':       like_growth,
+        'comment_growth':    comm_growth,
+        'view_growth_rate':  view_growth_rate,
+        'comment_growth_rate': comm_growth_rate,
+        'source_type':       video_meta.get('source_type', 'competitor'),
+    }
+
+
+def run_snapshot_collect():
+    """
+    경쟁채널 + 자체채널 전체 영상 stats 갱신 + 시계열 스냅샷 저장.
+    stats-refresh를 대체하는 통합 모드.
+    """
+    print(f"📸 스냅샷 수집 시작 ({datetime.now()})")
+    start = time.time()
+    today = datetime.now().date().isoformat()
+
+    all_metas = db.get_all_videos_for_snapshot()
+    if not all_metas:
+        print("📭 대상 영상 없음")
+        tg.send_message("📸 스냅샷: 대상 영상 없음")
+        return
+
+    print(f"📋 대상: {len(all_metas)}개 영상")
+    meta_map = {v['video_id']: v for v in all_metas}
+    all_ids  = list(meta_map.keys())
+    api_calls = (len(all_ids) - 1) // 50 + 1
+
+    # YouTube API로 최신 stats 수집
+    fresh_videos = yt.get_video_details(all_ids, min_duration=0)
+    if not fresh_videos:
+        print("⚠️ YouTube API 응답 없음")
+        return
+
+    fresh_map = {v['video_id']: v for v in fresh_videos}
+
+    # videos 테이블 일괄 upsert (stats 최신화)
+    comp_fresh = [v for v in fresh_videos if meta_map.get(v['video_id'], {}).get('source_type') == 'competitor']
+    if comp_fresh:
+        db.save_videos(comp_fresh)
+
+    # 스냅샷 row 생성 (직전 스냅샷 조회해서 growth 계산)
+    snapshots = []
+    for vid_id, fresh in fresh_map.items():
+        meta = meta_map.get(vid_id, {})
+        prev = db.get_last_video_snapshot(vid_id)
+        # 오늘 이미 저장된 스냅샷이면 skip
+        if prev and prev.get('snapshot_date') == today:
+            continue
+        snapshots.append(_build_snapshot(meta, fresh, prev, today))
+
+    saved = db.save_video_snapshots(snapshots)
+
+    duration = time.time() - start
+    print(f"✅ 스냅샷 완료: {saved}개 저장 / API {api_calls}호출 / {duration:.0f}초")
+    tg.send_message(
+        f"📸 스냅샷 수집 완료\n"
+        f"🎬 {saved}개 저장 / API {api_calls}호출 / {duration:.0f}초"
+    )
+
+
+def run_stats_refresh():
+    """경쟁채널 전체 영상 조회수·좋아요·댓글수 갱신 (YouTube API만, AI 없음)"""
+    print(f"📊 통계 갱신 시작 ({datetime.now()})")
+    start = time.time()
+
+    video_ids = db.get_all_tracked_video_ids()
+    if not video_ids:
+        print("📭 갱신할 영상 없음")
+        tg.send_message("📊 통계 갱신: Supabase에 영상 없음")
+        return
+
+    api_calls = (len(video_ids) - 1) // 50 + 1
+    print(f"📋 갱신 대상: {len(video_ids)}개 영상 (YouTube API {api_calls}호출)")
+
+    fresh_videos = yt.get_video_details(video_ids, min_duration=0)
+    saved = db.save_videos(fresh_videos)
+
+    duration = time.time() - start
+    print(f"✅ 통계 갱신 완료: {saved}개 / {api_calls}호출 / {duration:.0f}초")
+    tg.send_message(
+        f"📊 통계 갱신 완료\n"
+        f"🎬 {saved}개 영상 / API {api_calls}호출 / {duration:.0f}초"
+    )
+
+
+def run_thumbnail_backfill():
+    """HIT + IRREGULAR + top priority 영상 썸네일 Vision 분석 (Gemini Pro)"""
+    print(f"🖼️ 썸네일 분석 시작 ({datetime.now()})")
+    start = time.time()
+
+    targets = db.get_videos_for_thumbnail_analysis(mode='full_initial', limit=500)
+    if not targets:
+        print("📭 분석 대상 없음 (이미 모두 완료됐거나 qualifying 영상 없음)")
+        tg.send_message("🖼️ 썸네일 분석: 대상 없음")
+        return
+
+    print(f"📋 분석 대상: {len(targets)}개")
+    success, errors = 0, 0
+
+    for i, video in enumerate(targets):
+        thumbnail_url = video.get('thumbnail_url', '')
+        if not thumbnail_url:
+            errors += 1
+            continue
+        try:
+            result = gemini.analyze_thumbnail(thumbnail_url, video)
+            if 'error' in result:
+                print(f"  ❌ [{i+1}/{len(targets)}] {result['error']} — {video.get('title','')[:40]}")
+                errors += 1
+            else:
+                db.save_thumbnail_analysis(video['video_id'], result)
+                print(f"  ✅ [{i+1}/{len(targets)}] {video.get('title','')[:45]}")
+                success += 1
+            time.sleep(3)
+        except Exception as e:
+            print(f"  ❌ 예외 ({video.get('video_id','')}): {e}")
+            errors += 1
+
+    duration = time.time() - start
+    print(f"✅ 썸네일 분석 완료: 성공 {success}개 / 실패 {errors}개 / {duration/60:.1f}분")
+    tg.send_message(
+        f"🖼️ 썸네일 분석 완료\n"
+        f"✅ 성공 {success}개 / ❌ 실패 {errors}개 / {duration/60:.1f}분"
+    )
+
+
+# ───────────────────────────────────────────────
+# 모드 8: 주간 채널 리포트
 # ───────────────────────────────────────────────
 
 def run_weekly_report():
     print("📊 주간 채널 리포트 생성 시작")
     try:
-        recent = sheets.get_videos_from_sheet(days_back=7)
+        # Supabase에서 최신 stats로 조회 (stats-refresh 이후 실행 전제)
+        recent = db.get_recent_videos_from_db(days_back=7)
+        if not recent:
+            print("⚠️ 최근 7일 영상 없음 — 시트 fallback")
+            recent_raw = sheets.get_videos_from_sheet(days_back=7)
+            recent = [
+                {"channel_title": v.get("채널명",""), "title": v.get("제목",""),
+                 "view_count": int(v.get("조회수", 0) or 0)}
+                for v in recent_raw
+            ]
 
         from collections import defaultdict
         ch_map: dict[str, list] = defaultdict(list)
         for v in recent:
-            ch_map[v.get("채널명", "")].append({
-                "title":      v.get("제목", ""),
-                "view_count": int(v.get("조회수", 0) or 0),
+            ch_map[v.get("channel_title", "")].append({
+                "title":      v.get("title", ""),
+                "view_count": v.get("view_count", 0),
             })
 
         insights: dict[str, dict] = {}
@@ -751,15 +925,15 @@ def run_weekly_report():
         db.save_channel_insights(insights)
 
         top = sorted(
-            [{"title": v.get("제목",""), "channel_title": v.get("채널명",""),
-              "view_count": int(v.get("조회수",0) or 0)} for v in recent],
+            [{"title": v.get("title",""), "channel_title": v.get("channel_title",""),
+              "view_count": v.get("view_count", 0)} for v in recent],
             key=lambda x: x["view_count"], reverse=True
         )[:20]
 
         report = ds.generate_weekly_report(insights, top)
         sheets.save_weekly_report(report)
         db.save_weekly_report(report)
-        top_priority = db.get_top_priority_videos(limit=5, days_back=7)
+        top_priority = db.get_top_priority_videos(limit=5)
         tg.send_weekly_report_alert(report, top_priority)
         print("✅ 주간 채널 리포트 완료")
     except Exception as e:
@@ -806,6 +980,12 @@ if __name__ == "__main__":
         run_score_backfill()
     elif mode == "score-sheets-sync":
         run_score_sheets_sync()
+    elif mode == "stats-refresh":
+        run_stats_refresh()
+    elif mode == "snapshot-collect":
+        run_snapshot_collect()
+    elif mode == "thumbnail-backfill":
+        run_thumbnail_backfill()
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")

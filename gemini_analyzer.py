@@ -210,6 +210,72 @@ def analyze_own_video(video_data, retry=3):
     return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
 
 
+THUMBNAIL_PROMPT = """
+당신은 유튜브 썸네일 분석 전문가입니다.
+이 썸네일 이미지를 분석해 다음 JSON으로 정리해주세요.
+
+채널: {channel}
+영상 제목: {title}
+
+{{
+  "face_count": "0~5 사이 정수 (등장 얼굴 수)",
+  "main_emotion": "기쁨/놀람/슬픔/진지함/유머/공감/따뜻함/의아함/없음 중 하나",
+  "food_present": "음식이 메인 소재면 true, 아니면 false",
+  "couple_present": "커플/부부가 있으면 true",
+  "family_present": "가족 구성이 보이면 true",
+  "home_visible": "집/주방/실내 공간이 주 배경이면 true",
+  "luxury_signal": "명품/고급 소품/고급 공간이 보이면 true",
+  "text_overlay": "썸네일에 텍스트가 있으면 true",
+  "thumbnail_style": "인물중심/텍스트강조/음식중심/일상/드라마틱/미니멀/기타 중 하나",
+  "camera_distance": "클로즈업/미디엄/풀샷/없음 중 하나",
+  "emotion_intensity": "감정 강도 1~10 정수",
+  "ctr_prediction": "높음/보통/낮음 중 하나",
+  "ctr_reason": "CTR 예측 근거 1줄"
+}}
+
+JSON만 반환하세요.
+"""
+
+
+def analyze_thumbnail(thumbnail_url: str, video_data: dict, retry: int = 3) -> dict:
+    """썸네일 Vision 분석 (Gemini Pro)"""
+    import requests as _requests
+    from vertexai.generative_models import Part
+
+    _ensure_configured()
+    model_name = config.get_gemini_model('vision')
+    model = GenerativeModel(model_name)
+
+    prompt = THUMBNAIL_PROMPT.format(
+        channel=video_data.get('channel_title', ''),
+        title=video_data.get('title', '')
+    )
+
+    for attempt in range(retry):
+        try:
+            img_bytes = _requests.get(thumbnail_url, timeout=10).content
+            image_part = Part.from_data(img_bytes, mime_type='image/jpeg')
+            response = model.generate_content([image_part, prompt])
+            result = _extract_json(response.text)
+            result['video_id'] = video_data.get('video_id', '')
+            result['model_used'] = model_name
+            return result
+        except json.JSONDecodeError as e:
+            if attempt < retry - 1:
+                time.sleep(2)
+                continue
+            return {'video_id': video_data.get('video_id', ''), 'error': f'JSON 파싱 실패: {e}'}
+        except Exception as e:
+            err = str(e)
+            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted"]):
+                print(f"  ⚠️ Rate limit (시도 {attempt+1}), 60초 대기...")
+                time.sleep(60)
+                continue
+            return {'video_id': video_data.get('video_id', ''), 'error': err}
+
+    return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
+
+
 def detect_daily_trends(trending_videos):
     """일일 트렌드 영상에서 패턴 감지"""
     _ensure_configured()

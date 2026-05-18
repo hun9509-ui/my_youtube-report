@@ -601,7 +601,7 @@ def get_score_backfill_rows() -> tuple:
         return [], []
 
 
-def get_top_priority_videos(limit: int = 5, days_back: int = 7) -> list:
+def get_top_priority_videos(limit: int = 5) -> list:
     """priority_score 상위 N개 조회 (videos 조인)"""
     client = get_client()
     if not client:
@@ -682,3 +682,181 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
     except Exception as e:
         print(f"  ⚠️ 주간 트렌드 조회 실패: {e}")
         return {}
+
+
+def get_all_tracked_video_ids() -> list:
+    """경쟁채널 전체 video_id 목록 (통계 갱신용)"""
+    client = get_client()
+    if not client:
+        return []
+    try:
+        result = client.table('videos').select('video_id').execute()
+        return [r['video_id'] for r in result.data]
+    except Exception as e:
+        print(f"  ⚠️ video_id 목록 조회 실패: {e}")
+        return []
+
+
+def get_recent_videos_from_db(days_back: int = 7) -> list:
+    """최근 N일간 업로드된 경쟁채널 영상 조회 (갱신된 stats 포함)"""
+    client = get_client()
+    if not client:
+        return []
+    cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
+    try:
+        result = client.table('videos')\
+            .select('video_id,channel_title,title,view_count,like_count,comment_count,published_at,video_url')\
+            .gte('published_at', cutoff)\
+            .order('view_count', desc=True)\
+            .execute()
+        return result.data
+    except Exception as e:
+        print(f"  ⚠️ 최근 영상 조회 실패: {e}")
+        return []
+
+
+# ───────────────────────────────────────────────
+# video_snapshots: 시계열 스냅샷
+# ───────────────────────────────────────────────
+
+def get_last_video_snapshot(video_id: str) -> dict | None:
+    """직전 스냅샷 조회 (growth 계산용)"""
+    client = get_client()
+    if not client:
+        return None
+    try:
+        result = client.table('video_snapshots')\
+            .select('view_count,like_count,comment_count,snapshot_date')\
+            .eq('video_id', video_id)\
+            .order('snapshot_date', desc=True)\
+            .limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception:
+        return None
+
+
+def save_video_snapshots(snapshots: list) -> int:
+    """video_snapshots 일괄 저장 (video_id + snapshot_date upsert)"""
+    client = get_client()
+    if not client or not snapshots:
+        return 0
+    try:
+        client.table('video_snapshots').upsert(
+            snapshots, on_conflict='video_id,snapshot_date'
+        ).execute()
+        return len(snapshots)
+    except Exception as e:
+        print(f"  ⚠️ video_snapshots 저장 실패: {e}")
+        return 0
+
+
+def get_all_videos_for_snapshot() -> list:
+    """스냅샷 대상 전체 영상 (경쟁채널 + 자체채널)"""
+    client = get_client()
+    if not client:
+        return []
+    try:
+        comp = client.table('videos')\
+            .select('video_id,channel_title,published_at')\
+            .execute().data
+        for v in comp:
+            v['source_type'] = 'competitor'
+
+        own = client.table('own_channel_videos')\
+            .select('video_id,published_at')\
+            .execute().data
+        for v in own:
+            v['source_type'] = 'own'
+            v['channel_title'] = config.OWN_CHANNEL
+
+        return comp + own
+    except Exception as e:
+        print(f"  ⚠️ 스냅샷 대상 조회 실패: {e}")
+        return []
+
+
+# ───────────────────────────────────────────────
+# thumbnail_analysis: 썸네일 Vision 분석
+# ───────────────────────────────────────────────
+
+def save_thumbnail_analysis(video_id: str, analysis: dict) -> bool:
+    """썸네일 분석 결과 저장"""
+    client = get_client()
+    if not client:
+        return False
+    try:
+        client.table('thumbnail_analysis').upsert({
+            'video_id': video_id,
+            'analyzed_at': datetime.now().isoformat(),
+            'face_count': analysis.get('face_count'),
+            'main_emotion': analysis.get('main_emotion', ''),
+            'food_present': analysis.get('food_present', False),
+            'couple_present': analysis.get('couple_present', False),
+            'family_present': analysis.get('family_present', False),
+            'home_visible': analysis.get('home_visible', False),
+            'luxury_signal': analysis.get('luxury_signal', False),
+            'text_overlay': analysis.get('text_overlay', False),
+            'thumbnail_style': analysis.get('thumbnail_style', ''),
+            'camera_distance': analysis.get('camera_distance', ''),
+            'emotion_intensity': analysis.get('emotion_intensity'),
+            'ctr_prediction': analysis.get('ctr_prediction', ''),
+            'ctr_reason': analysis.get('ctr_reason', ''),
+            'model_used': analysis.get('model_used', ''),
+            'raw_analysis': analysis,
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"  ⚠️ thumbnail_analysis 저장 실패 ({video_id[:8]}...): {e}")
+        return False
+
+
+def get_videos_for_thumbnail_analysis(mode: str = 'full_initial', limit: int = 500) -> list:
+    """
+    썸네일 분석 대상 영상 조회 (미분석만)
+    mode='full_initial' : initial_analysis 전체 영상 (기본 — 전수 backfill용)
+    mode='priority'     : HIT + IRREGULAR + priority_score≥70 (일상 운영용)
+    """
+    client = get_client()
+    if not client:
+        return []
+    try:
+        # 이미 분석된 video_id
+        done = {r['video_id'] for r in
+                client.table('thumbnail_analysis').select('video_id').execute().data}
+
+        if mode == 'full_initial':
+            # initial_analysis 전체 video_id
+            rows = client.table('initial_analysis').select('video_id').execute().data
+            candidates = {r['video_id'] for r in rows}
+        else:
+            candidates = set()
+            # HIT 영상
+            hit = client.table('initial_analysis').select('video_id')\
+                .eq('is_hit', True).execute().data
+            candidates.update(r['video_id'] for r in hit)
+            # IRREGULAR
+            irreg = client.table('trend_classified').select('video_id')\
+                .eq('track', 'IRREGULAR').execute().data
+            candidates.update(r['video_id'] for r in irreg)
+            # priority 상위
+            top = client.table('video_scores').select('video_id')\
+                .gte('priority_score', 70)\
+                .order('priority_score', desc=True).limit(100).execute().data
+            candidates.update(r['video_id'] for r in top)
+
+        targets = list(candidates - done)[:limit]
+        if not targets:
+            return []
+
+        # 50개씩 나눠서 videos 테이블 조회 (PostgREST in 절 한도 대응)
+        result = []
+        for i in range(0, len(targets), 50):
+            chunk = targets[i:i+50]
+            rows = client.table('videos')\
+                .select('video_id,title,channel_title,thumbnail_url')\
+                .in_('video_id', chunk).execute().data
+            result.extend(rows)
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 썸네일 분석 대상 조회 실패: {e}")
+        return []
