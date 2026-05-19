@@ -59,11 +59,15 @@ TOP_COMMENTS_COUNT = 200
 TRENDING_VIDEOS_COUNT = 50
 
 # ===== Gemini 모델 =====
+# TEXT_ANALYSIS_ENGINE: "gemini" | "deepseek"
+# "gemini"로 설정하면 deepseek_processor의 모든 분석이 Gemini로 라우팅됨
+TEXT_ANALYSIS_ENGINE = "gemini"
+
 def get_gemini_model(mode='daily'):
-    """mode: 'initial' | 'daily' | 'free' | 'vision'"""
+    """mode: 'initial' | 'daily' | 'free' | 'vision' | 'text'"""
     if mode == 'free':
         return "gemini-2.0-flash-001"
-    if mode == 'vision':
+    if mode in ('vision', 'text'):
         return "gemini-3.1-pro-preview"
     return "gemini-2.5-flash"
 

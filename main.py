@@ -7,6 +7,12 @@
   python main.py trend-collect        : 매일 트렌드 수집 + 이레귤러 즉시 알림
   python main.py trend-weekly         : 월요일 주간 트렌드 종합 알림
   python main.py weekly               : 주간 채널 리포트
+  python main.py full-backfill        : 미분석 영상 전체 Gemini+DeepSeek 분석
+  python main.py comment-backfill     : 기존 분석 영상 댓글 재분석 (emotion_temperature 채우기)
+  python main.py thumbnail-backfill   : 썸네일 Vision 분석 미완료분 처리
+  python main.py score-backfill       : 전략 스코어 미산출분 처리
+  python main.py snapshot-collect     : 전체 영상 시계열 스냅샷 수집 (매일)
+  python main.py growth-pattern       : 성장 패턴 분류 업데이트
 """
 import sys
 sys.stdout.reconfigure(line_buffering=True)
@@ -35,10 +41,11 @@ import strategy_scorer as scorer; print("  ✓ strategy_scorer", flush=True)
 print("\n⏳ 환경변수 체크 중...", flush=True)
 required = {
     'YOUTUBE_API_KEY':    config.YOUTUBE_API_KEY,
-    'DEEPSEEK_API_KEY':   config.DEEPSEEK_API_KEY,
     'TELEGRAM_BOT_TOKEN': config.TELEGRAM_BOT_TOKEN,
     'TELEGRAM_CHAT_ID':   config.TELEGRAM_CHAT_ID,
 }
+if getattr(config, 'TEXT_ANALYSIS_ENGINE', 'deepseek') == 'deepseek':
+    required['DEEPSEEK_API_KEY'] = config.DEEPSEEK_API_KEY
 missing = [k for k, v in required.items() if not v]
 if missing:
     print(f"❌ 누락된 환경변수: {missing}", flush=True)
@@ -890,13 +897,203 @@ def run_thumbnail_backfill():
 
 
 # ───────────────────────────────────────────────
-# 모드 8: 주간 채널 리포트
+# 모드 8: 성장 패턴 업데이트 (스냅샷 데이터 후처리)
+# ───────────────────────────────────────────────
+
+def run_growth_pattern_update():
+    """video_snapshots D1/D7/D30 비교 → growth_pattern 자동 분류"""
+    print(f"📈 성장 패턴 분류 시작 ({datetime.now()})")
+    updated = db.update_growth_patterns()
+    print(f"✅ 성장 패턴 업데이트: {updated}개")
+    tg.send_message(f"📈 성장 패턴 분류 완료: {updated}개 영상 업데이트")
+
+
+# ───────────────────────────────────────────────
+# 모드 A: 미분석 영상 전체 분석 (full-backfill)
+# ───────────────────────────────────────────────
+
+def run_full_backfill():
+    """
+    videos 테이블에 있지만 initial_analysis가 없는 영상 전부 분석.
+    Gemini 3.1 Pro 영상분석 + 썸네일 Vision + DeepSeek 댓글분석 → initial_analysis 저장.
+    """
+    print(f"🔬 전체 백필 시작 ({datetime.now()})")
+    start = time.time()
+
+    targets = db.get_unanalyzed_videos()
+    if not targets:
+        print("📭 미분석 영상 없음")
+        tg.send_message("🔬 full-backfill: 미분석 영상 없음 (모두 완료)")
+        return
+
+    print(f"📋 대상: {len(targets)}개")
+
+    # 채널별 평균 조회수 계산 (is_hit 태그용)
+    from collections import defaultdict
+    ch_views: dict[str, list] = defaultdict(list)
+    for v in targets:
+        ch_views[v.get('channel_title', '')].append(v.get('view_count', 0))
+    ch_avg = {ch: sum(vs)/len(vs) for ch, vs in ch_views.items() if vs}
+
+    for v in targets:
+        avg = ch_avg.get(v.get('channel_title', ''), 0)
+        v['channel_avg_views'] = int(avg)
+        v['is_hit'] = avg > 0 and v.get('view_count', 0) >= avg * config.HIT_VIDEO_MULTIPLIER
+
+    # Gemini 영상 분석
+    print(f"\n🤖 Gemini 영상분석 ({len(targets)}개, model=initial)")
+    gemini_results = gemini.analyze_videos_batch(targets, delay=5, model_mode='initial')
+
+    # 댓글 + DeepSeek 분석 → buffer 저장
+    buffer: list[dict] = []
+    total_saved = 0
+    success, errors = 0, 0
+
+    for i, video in enumerate(targets):
+        g_result = next(
+            (g for g in gemini_results if g.get('video_id') == video['video_id']),
+            {'error': 'Gemini 매칭 실패'}
+        )
+        analysis = analyze_video_complete(video, g_result)
+        analysis['is_hit'] = video.get('is_hit', False)
+        analysis['channel_avg_views'] = video.get('channel_avg_views', 0)
+        buffer.append(analysis)
+
+        if 'error' not in g_result:
+            success += 1
+        else:
+            errors += 1
+
+        print(f"  [{i+1}/{len(targets)}] {'⭐' if video.get('is_hit') else '  '} {video.get('title','')[:45]}")
+
+        if len(buffer) >= 10:
+            _save_analyses(buffer, 'initial', batch_num=0)
+            total_saved += len(buffer)
+            print(f"  💾 중간 저장 ({total_saved}개 누적)")
+            buffer = []
+            time.sleep(1)
+
+    if buffer:
+        _save_analyses(buffer, 'initial', batch_num=0)
+        total_saved += len(buffer)
+
+    # 썸네일 backfill (같은 대상)
+    print(f"\n🖼️ 썸네일 Vision 분석 ({len(targets)}개)")
+    thumb_ok, thumb_err = 0, 0
+    for i, video in enumerate(targets):
+        thumbnail_url = video.get('thumbnail_url', '')
+        if not thumbnail_url:
+            thumb_err += 1
+            continue
+        try:
+            result = gemini.analyze_thumbnail(thumbnail_url, video)
+            if 'error' not in result:
+                db.save_thumbnail_analysis(video['video_id'], result)
+                thumb_ok += 1
+                print(f"  🖼️ [{i+1}/{len(targets)}] {video.get('title','')[:45]}")
+            else:
+                thumb_err += 1
+            time.sleep(3)
+        except Exception as e:
+            print(f"  ❌ 썸네일 실패 ({video.get('video_id','')}): {e}")
+            thumb_err += 1
+
+    # 전략 스코어
+    all_analyses = buffer  # buffer는 이미 비었으니 전체 재구성 불필요 — 이미 저장됨
+    # (스코어는 score-backfill로 별도 실행)
+
+    duration = time.time() - start
+    msg = (
+        f"🔬 <b>full-backfill 완료</b>\n\n"
+        f"📺 대상: {len(targets)}개\n"
+        f"✅ 분석 저장: {total_saved}개\n"
+        f"🖼️ 썸네일: {thumb_ok}개 / ❌ {thumb_err}개\n"
+        f"⏱️ {duration/60:.1f}분"
+    )
+    tg.send_message(msg)
+    print(f"\n✅ full-backfill 완료 ({duration/60:.1f}분)")
+
+
+# ───────────────────────────────────────────────
+# 모드 B: 댓글 재분석 백필 (comment-backfill)
+# ───────────────────────────────────────────────
+
+def run_comment_backfill():
+    """
+    initial_analysis 전체에서 emotion_temperature 없는 영상 댓글 재분석.
+    YouTube 댓글 재수집 + DeepSeek analyze_comments() → deepseek_raw 갱신.
+    """
+    print(f"💬 댓글 재분석 백필 시작 ({datetime.now()})")
+    start = time.time()
+
+    targets = db.get_videos_needing_comment_reanalysis()
+    if not targets:
+        print("📭 재분석 대상 없음 (모두 emotion_temperature 존재)")
+        tg.send_message("💬 comment-backfill: 처리할 영상 없음")
+        return
+
+    print(f"📋 대상: {len(targets)}개")
+    success, skipped, errors = 0, 0, 0
+
+    for i, target in enumerate(targets):
+        video_id = target['video_id']
+        title = target.get('title', '')
+        comment_count = target.get('comment_count', 0)
+
+        if comment_count == 0:
+            skipped += 1
+            print(f"  [{i+1}/{len(targets)}] ⏩ 댓글 없음: {title[:40]}")
+            continue
+
+        try:
+            comments = yt.get_video_comments(video_id, max_comments=config.TOP_COMMENTS_COUNT)
+            if not comments:
+                skipped += 1
+                print(f"  [{i+1}/{len(targets)}] ⚠️ 댓글 수집 실패: {title[:40]}")
+                continue
+
+            result = ds.analyze_comments(title, comments)
+            if 'error' in result:
+                errors += 1
+                print(f"  [{i+1}/{len(targets)}] ❌ DeepSeek: {result['error'][:50]}")
+                continue
+
+            db.update_comment_analysis(video_id, result)
+            success += 1
+            emo = result.get('dominant_emotion', '?')
+            alg = result.get('algorithm_discovery_rate', '?')
+            print(f"  [{i+1}/{len(targets)}] ✅ {title[:35]} | {emo} | alg {alg}%")
+            time.sleep(2)
+
+        except Exception as e:
+            errors += 1
+            print(f"  [{i+1}/{len(targets)}] ❌ 예외: {e}")
+
+        if (i + 1) % 20 == 0:
+            elapsed = time.time() - start
+            print(f"\n  📊 중간: 완료 {success} / 스킵 {skipped} / 에러 {errors} ({elapsed/60:.1f}분)\n")
+
+    duration = time.time() - start
+    print(f"\n✅ 댓글 백필 완료: {success}개 / 스킵 {skipped}개 / 에러 {errors}개 / {duration/60:.1f}분")
+    tg.send_message(
+        f"💬 <b>comment-backfill 완료</b>\n\n"
+        f"✅ {success}개 / ⏩ {skipped}개 / ❌ {errors}개\n"
+        f"⏱️ {duration/60:.1f}분"
+    )
+
+
+# ───────────────────────────────────────────────
+# 모드 9: 주간 채널 리포트
 # ───────────────────────────────────────────────
 
 def run_weekly_report():
     print("📊 주간 채널 리포트 생성 시작")
     try:
-        # Supabase에서 최신 stats로 조회 (stats-refresh 이후 실행 전제)
+        # 1. 성장 패턴 최신화
+        print("  📈 성장 패턴 분류 중...")
+        db.update_growth_patterns()
+
+        # 2. 최신 stats 기준 영상 조회
         recent = db.get_recent_videos_from_db(days_back=7)
         if not recent:
             print("⚠️ 최근 7일 영상 없음 — 시트 fallback")
@@ -915,6 +1112,7 @@ def run_weekly_report():
                 "view_count": v.get("view_count", 0),
             })
 
+        # 3. 채널별 성공공식
         insights: dict[str, dict] = {}
         for ch, vids in ch_map.items():
             if len(vids) >= 3:
@@ -930,11 +1128,31 @@ def run_weekly_report():
             key=lambda x: x["view_count"], reverse=True
         )[:20]
 
+        # 4. 기존 주간 리포트
         report = ds.generate_weekly_report(insights, top)
         sheets.save_weekly_report(report)
         db.save_weekly_report(report)
+
+        # 5. 시장 변화 분석 (market intelligence)
+        print("  🧠 시장 변화 분석 중...")
+        snapshot_summary = db.get_snapshot_growth_summary(days_back=7)
+        emotion_summary = db.get_emotion_summary(days_back=7)
+
+        # top 영상에 growth_pattern 병합
+        snap_rows = snapshot_summary.get('top_growing', [])
+        snap_map = {r['video_id']: r.get('growth_pattern') for r in snap_rows}
+        for v in top:
+            v['growth_pattern'] = snap_map.get(v.get('video_id', ''), '')
+
+        market_state = ds.generate_market_intelligence(snapshot_summary, emotion_summary, top)
+        if 'error' not in market_state:
+            db.save_weekly_market_state(market_state)
+            print(f"  ✅ 시장 변화 분석 저장 완료")
+        else:
+            print(f"  ⚠️ 시장 분석 실패: {market_state.get('error')}")
+
         top_priority = db.get_top_priority_videos(limit=5)
-        tg.send_weekly_report_alert(report, top_priority)
+        tg.send_weekly_report_alert(report, top_priority, market_state)
         print("✅ 주간 채널 리포트 완료")
     except Exception as e:
         print(f"❌ 주간 리포트 오류: {e}")
@@ -982,10 +1200,16 @@ if __name__ == "__main__":
         run_score_sheets_sync()
     elif mode == "stats-refresh":
         run_stats_refresh()
+    elif mode == "growth-pattern":
+        run_growth_pattern_update()
     elif mode == "snapshot-collect":
         run_snapshot_collect()
     elif mode == "thumbnail-backfill":
         run_thumbnail_backfill()
+    elif mode == "full-backfill":
+        run_full_backfill()
+    elif mode == "comment-backfill":
+        run_comment_backfill()
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")

@@ -64,7 +64,7 @@ def send_daily_trend_alert(trend_summary):
     return send_message(message.strip())
 
 
-def send_weekly_report_alert(report, top_priority=None):
+def send_weekly_report_alert(report, top_priority=None, market_state=None):
     """주간 리포트 알림 (매주 월요일 오전 10시)"""
     if 'error' in report:
         return send_message(f"⚠️ 주간 리포트 생성 실패: {report['error']}")
@@ -94,6 +94,30 @@ def send_weekly_report_alert(report, top_priority=None):
             if reason:
                 top5_text += f"     → {reason}\n"
 
+    # 시장 변화 분석 섹션
+    market_section = ""
+    if market_state and 'error' not in market_state:
+        dominant = market_state.get('dominant_emotion', '')
+        gap = market_state.get('competitive_gap', [])
+        opportunity = market_state.get('hangoeun_opportunity_score', 0)
+        recommended = market_state.get('hangoeun_recommended_topics', [])
+        fatigue = market_state.get('viewer_fatigue_signals', [])
+        rec_text = "\n".join([f"  ▸ {t}" for t in recommended[:3]])
+        gap_text = "\n".join([f"  ▸ {g}" for g in gap[:2]])
+        fatigue_text = ", ".join(fatigue[:2]) if fatigue else "없음"
+        market_section = f"""
+
+🧠 <b>시장 변화 분석</b>
+이번 주 감정: <b>{dominant}</b> | 기회점수: <b>{opportunity}점</b>
+시청자 피로: {fatigue_text}
+
+🎯 <b>한고은 기회 주제 (30일 후 업로드 기준)</b>
+{rec_text}
+
+🔍 <b>경쟁 공백</b>
+{gap_text}
+"""
+
     message = f"""
 📊 <b>주간 경쟁 채널 리포트</b>
 ━━━━━━━━━━━━━━━━━━
@@ -117,7 +141,7 @@ def send_weekly_report_alert(report, top_priority=None):
 {insights_text}
 
 🎯 <b>다음 영상 방향성</b>
-{suggestions_text}{top5_text}
+{suggestions_text}{market_section}{top5_text}
 ━━━━━━━━━━━━━━━━━━
 📊 전체 데이터는 구글 시트에서 확인
 """

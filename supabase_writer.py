@@ -871,3 +871,247 @@ def get_videos_for_thumbnail_analysis(mode: str = 'full_initial', limit: int = 5
     except Exception as e:
         print(f"  ⚠️ 썸네일 분석 대상 조회 실패: {e}")
         return []
+
+
+# ───────────────────────────────────────────────
+# weekly_market_state: 시장 변화 분석
+# ───────────────────────────────────────────────
+
+def save_weekly_market_state(state: dict) -> bool:
+    """주간 시장 분석 저장 (report_date upsert)"""
+    client = get_client()
+    if not client:
+        return False
+    today = datetime.now().date().isoformat()
+    try:
+        client.table('weekly_market_state').upsert({
+            'report_date': today,
+            'dominant_emotion': state.get('dominant_emotion', ''),
+            'rising_topics': state.get('rising_topics', []),
+            'declining_topics': state.get('declining_topics', []),
+            'oversaturated_formats': state.get('oversaturated_formats', []),
+            'emerging_formats': state.get('emerging_formats', []),
+            'viewer_fatigue_signals': state.get('viewer_fatigue_signals', []),
+            'comfort_content_score': state.get('comfort_content_score', 0),
+            'hangoeun_opportunity_score': state.get('hangoeun_opportunity_score', 0),
+            'hangoeun_recommended_topics': state.get('hangoeun_recommended_topics', []),
+            'competitive_gap': state.get('competitive_gap', []),
+            'market_summary': state.get('market_summary', ''),
+            'raw_analysis': state,
+        }, on_conflict='report_date').execute()
+        print(f"  💾 Supabase: weekly_market_state 저장 ({today})")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ weekly_market_state 저장 실패: {e}")
+        return False
+
+
+def get_snapshot_growth_summary(days_back: int = 7) -> dict:
+    """
+    지난 N일 스냅샷에서 성장 패턴 집계.
+    반환: {pattern: count, avg_growth_rate, top_growing: [...]}
+    """
+    client = get_client()
+    if not client:
+        return {}
+    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+    try:
+        rows = client.table('video_snapshots')\
+            .select('video_id,channel_title,view_count,view_growth,view_growth_rate,growth_pattern,source_type')\
+            .gte('snapshot_date', cutoff)\
+            .order('view_growth', desc=True)\
+            .execute().data
+
+        from collections import Counter
+        pattern_counter = Counter(r.get('growth_pattern') for r in rows if r.get('growth_pattern'))
+        avg_growth = sum(r.get('view_growth_rate', 0) or 0 for r in rows) / max(len(rows), 1)
+
+        top_growing = sorted(
+            [r for r in rows if r.get('view_growth', 0) > 0],
+            key=lambda x: x.get('view_growth', 0), reverse=True
+        )[:20]
+
+        return {
+            'pattern_counts': dict(pattern_counter),
+            'avg_growth_rate': round(avg_growth, 4),
+            'total_snapshots': len(rows),
+            'top_growing': top_growing,
+        }
+    except Exception as e:
+        print(f"  ⚠️ 스냅샷 성장 집계 실패: {e}")
+        return {}
+
+
+def get_emotion_summary(days_back: int = 7) -> dict:
+    """
+    지난 N일 댓글 분석에서 감정 온도 집계.
+    initial_analysis + daily_analysis의 deepseek_raw.emotion_temperature 평균
+    """
+    client = get_client()
+    if not client:
+        return {}
+    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+
+    emotions = ['comfort', 'healing', 'nostalgia', 'trust', 'intimacy',
+                'aspiration', 'envy', 'fatigue', 'cringe']
+    totals = {e: 0 for e in emotions}
+    count = 0
+
+    try:
+        for table in ['daily_analysis', 'initial_analysis']:
+            rows = client.table(table)\
+                .select('deepseek_raw')\
+                .gte('analysis_date', cutoff)\
+                .execute().data
+            for r in rows:
+                raw = r.get('deepseek_raw') or {}
+                et = raw.get('emotion_temperature') or {}
+                if et:
+                    for e in emotions:
+                        totals[e] += et.get(e, 0) or 0
+                    count += 1
+
+        if count == 0:
+            return {}
+        return {e: round(totals[e] / count, 1) for e in emotions}
+    except Exception as e:
+        print(f"  ⚠️ 감정 온도 집계 실패: {e}")
+        return {}
+
+
+def get_unanalyzed_videos(limit: int = None) -> list:
+    """
+    videos 테이블에 있지만 initial_analysis가 없는 영상 목록 반환.
+    full-backfill 대상 조회용.
+    """
+    client = get_client()
+    if not client:
+        return []
+    try:
+        all_vids = client.table('videos')\
+            .select('video_id,channel_title,title,view_count,like_count,comment_count,published_at,thumbnail_url,video_url,duration,tags,description')\
+            .execute().data
+        analyzed = {r['video_id'] for r in
+                    client.table('initial_analysis').select('video_id').execute().data}
+        result = [v for v in all_vids if v['video_id'] not in analyzed]
+        if limit:
+            result = result[:limit]
+        print(f"  📋 미분석 영상: {len(result)}개 (전체 {len(all_vids)}개 중)")
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 미분석 영상 조회 실패: {e}")
+        return []
+
+
+def get_videos_needing_comment_reanalysis(limit: int = None) -> list:
+    """
+    emotion_temperature가 없는 initial_analysis 영상 목록 반환.
+    [(video_id, title, comment_count), ...] 형태의 dict 리스트
+    """
+    client = get_client()
+    if not client:
+        return []
+    try:
+        q = client.table('initial_analysis')\
+            .select('video_id, deepseek_raw, videos(title, comment_count)')
+        if limit:
+            q = q.limit(limit)
+        result = q.execute()
+
+        rows = []
+        for r in result.data:
+            ds_raw = r.get('deepseek_raw') or {}
+            if not ds_raw.get('emotion_temperature'):
+                video_meta = r.get('videos') or {}
+                rows.append({
+                    'video_id': r['video_id'],
+                    'title': video_meta.get('title', ''),
+                    'comment_count': video_meta.get('comment_count', 0),
+                })
+        return rows
+    except Exception as e:
+        print(f"  ⚠️ comment reanalysis 대상 조회 실패: {e}")
+        return []
+
+
+def update_comment_analysis(video_id: str, comments_result: dict) -> bool:
+    """initial_analysis의 deepseek_raw를 새 댓글 분석 결과로 갱신 (기존 필드 보존)"""
+    client = get_client()
+    if not client:
+        return False
+    try:
+        res = client.table('initial_analysis').select('deepseek_raw')\
+            .eq('video_id', video_id).limit(1).execute()
+        existing = (res.data[0].get('deepseek_raw') or {}) if res.data else {}
+        merged = {**existing, **comments_result, '_version': config.ANALYSIS_VERSION}
+        client.table('initial_analysis').update({'deepseek_raw': merged})\
+            .eq('video_id', video_id).execute()
+        return True
+    except Exception as e:
+        print(f"  ⚠️ update_comment_analysis 실패 ({video_id[:8]}...): {e}")
+        return False
+
+
+def update_growth_patterns(video_ids: list = None) -> int:
+    """
+    video_snapshots에서 D1/D7/D30 스냅샷을 비교해 growth_pattern 업데이트.
+    video_ids=None이면 전체 대상.
+    """
+    client = get_client()
+    if not client:
+        return 0
+
+    import deepseek_processor as ds
+
+    try:
+        # 스냅샷이 2개 이상인 video_id 목록
+        q = client.table('video_snapshots').select('video_id').execute()
+        all_ids = list({r['video_id'] for r in q.data})
+        if video_ids:
+            all_ids = [v for v in all_ids if v in video_ids]
+
+        updated = 0
+        for vid in all_ids:
+            snaps = client.table('video_snapshots')\
+                .select('snapshot_date,view_count,days_since_publish')\
+                .eq('video_id', vid)\
+                .order('snapshot_date').execute().data
+
+            if len(snaps) < 2:
+                continue
+
+            # days_since_publish 기준으로 D1/D7/D30 근사값 추출
+            def closest(target_days):
+                valid = [s for s in snaps if s.get('days_since_publish') is not None]
+                if not valid:
+                    return None
+                return min(valid, key=lambda s: abs((s.get('days_since_publish') or 0) - target_days))
+
+            d1 = closest(1)
+            d7 = closest(7)
+            d30 = closest(30)
+
+            d1_v = d1['view_count'] if d1 else 0
+            d7_v = d7['view_count'] if d7 else 0
+            d30_v = d30['view_count'] if d30 else 0
+
+            pattern = ds.classify_growth_pattern(d1_v, d7_v, d30_v)
+            if pattern == 'UNKNOWN':
+                continue
+
+            d7_ratio = round(d7_v / d1_v, 4) if d1_v > 0 and d7_v > 0 else None
+            d30_ratio = round(d30_v / d7_v, 4) if d7_v > 0 and d30_v > 0 else None
+
+            client.table('video_snapshots')\
+                .update({
+                    'growth_pattern': pattern,
+                    'd7_view_ratio': d7_ratio,
+                    'd30_view_ratio': d30_ratio,
+                })\
+                .eq('video_id', vid).execute()
+            updated += 1
+
+        return updated
+    except Exception as e:
+        print(f"  ⚠️ growth_pattern 업데이트 실패: {e}")
+        return 0
