@@ -53,29 +53,29 @@ def search_channel_id(channel_name):
     return None
 
 
-def get_channel_videos(channel_id, months_back=6):
-    """채널의 최근 N개월 영상 목록 가져오기"""
+def get_channel_videos(channel_id, months_back=6, before_date=None):
+    """채널의 최근 N개월 영상 목록 가져오기.
+    before_date: 이 날짜 이후 영상은 skip (이미 수집된 구간 제외용)
+    """
     youtube = get_youtube_client()
-    
-    # 채널 정보로 uploads 플레이리스트 ID 가져오기
+
     channel_response = youtube.channels().list(
         id=channel_id,
         part='contentDetails,statistics,snippet'
     ).execute()
-    
+
     if not channel_response.get('items'):
         return [], {}
-    
+
     channel_info = channel_response['items'][0]
     uploads_playlist = channel_info['contentDetails']['relatedPlaylists']['uploads']
     subscriber_count = int(channel_info['statistics'].get('subscriberCount', 0))
-    
-    # 기간 설정
+
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=months_back * 30)
-    
+
     videos = []
     next_page_token = None
-    
+
     while True:
         playlist_response = youtube.playlistItems().list(
             playlistId=uploads_playlist,
@@ -83,29 +83,33 @@ def get_channel_videos(channel_id, months_back=6):
             maxResults=50,
             pageToken=next_page_token
         ).execute()
-        
+
         for item in playlist_response.get('items', []):
             published_at = datetime.fromisoformat(
                 item['snippet']['publishedAt'].replace('Z', '+00:00')
             )
-            
+
             if published_at < cutoff_date:
                 return videos, {
                     'subscriber_count': subscriber_count,
                     'channel_title': channel_info['snippet']['title']
                 }
-            
+
+            # 이미 수집된 구간이면 skip
+            if before_date and published_at >= before_date:
+                continue
+
             videos.append({
                 'video_id': item['contentDetails']['videoId'],
                 'title': item['snippet']['title'],
                 'published_at': item['snippet']['publishedAt'],
                 'channel_title': item['snippet']['channelTitle']
             })
-        
+
         next_page_token = playlist_response.get('nextPageToken')
         if not next_page_token:
             break
-    
+
     return videos, {
         'subscriber_count': subscriber_count,
         'channel_title': channel_info['snippet']['title']

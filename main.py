@@ -1018,6 +1018,110 @@ def run_full_backfill():
 # 모드 B: 댓글 재분석 백필 (comment-backfill)
 # ───────────────────────────────────────────────
 
+def run_history_extend(extra_months: int = 6):
+    """
+    각 채널의 기존 수집 기간 이전 extra_months개월치 추가 수집.
+    이미 DB에 있는 영상은 완전히 skip — 중복 없음.
+    """
+    print(f"📅 히스토리 확장 시작 ({extra_months}개월 추가, {datetime.now()})")
+    start = time.time()
+
+    all_new: list[dict] = []
+    channel_videos_map: dict[str, list[dict]] = {}
+
+    for name, channel_id in config.TARGET_CHANNELS.items():
+        try:
+            oldest = db.get_oldest_video_date_by_channel(name)
+            if not oldest:
+                print(f"  ⚠️ {name}: 기존 데이터 없음, 스킵")
+                continue
+
+            # oldest 이전 구간만 수집 (oldest 이후는 before_date로 skip)
+            months_total = int((datetime.now(timezone.utc) - oldest).days / 30) + extra_months
+            print(f"\n  📺 {name}: oldest={oldest.date()} → {months_total}개월치 범위로 수집")
+
+            raw_videos, channel_info = yt.get_channel_videos(
+                channel_id,
+                months_back=months_total,
+                before_date=oldest
+            )
+            if not raw_videos:
+                print(f"  📭 {name}: 추가 영상 없음")
+                continue
+
+            video_ids = [v['video_id'] for v in raw_videos]
+            detailed = yt.get_video_details(video_ids)
+            print(f"  ✅ {name}: {len(detailed)}개 신규 발견")
+
+            all_new.extend(detailed)
+            channel_videos_map[name] = detailed
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"  ❌ {name}: {e}")
+            tg.send_error_alert(str(e), f"history-extend - {name}")
+
+    if not all_new:
+        print("📭 추가 수집 영상 없음")
+        tg.send_message("📅 히스토리 확장: 추가 수집 영상 없음")
+        return
+
+    # 채널 평균 조회수 → is_hit 태그
+    from collections import defaultdict
+    ch_views: dict[str, list] = defaultdict(list)
+    for v in all_new:
+        ch_views[v.get('channel_title', '')].append(v.get('view_count', 0))
+    ch_avg = {ch: sum(vs)/len(vs) for ch, vs in ch_views.items() if vs}
+    for v in all_new:
+        avg = ch_avg.get(v.get('channel_title', ''), 0)
+        v['channel_avg_views'] = int(avg)
+        v['is_hit'] = avg > 0 and v.get('view_count', 0) >= avg * config.HIT_VIDEO_MULTIPLIER
+
+    sheets.save_videos(all_new)
+    db.save_videos(all_new)
+    print(f"\n💾 videos 저장: {len(all_new)}개")
+
+    # Gemini 분석
+    print(f"\n🤖 Gemini 분석 ({len(all_new)}개)")
+    gemini_results = gemini.analyze_videos_batch(all_new, delay=5, model_mode='initial')
+
+    buffer: list[dict] = []
+    total_saved = 0
+
+    for i, video in enumerate(all_new):
+        g_result = next(
+            (g for g in gemini_results if g.get('video_id') == video['video_id']),
+            {'error': 'Gemini 매칭 실패'}
+        )
+        analysis = analyze_video_complete(video, g_result)
+        analysis['is_hit'] = video.get('is_hit', False)
+        analysis['channel_avg_views'] = video.get('channel_avg_views', 0)
+        buffer.append(analysis)
+        print(f"  [{i+1}/{len(all_new)}] {'⭐' if video.get('is_hit') else '  '} {video.get('title','')[:45]}")
+
+        if len(buffer) >= 10:
+            _save_analyses(buffer, 'initial', batch_num=0)
+            total_saved += len(buffer)
+            print(f"  💾 중간 저장 ({total_saved}개 누적)")
+            buffer = []
+            time.sleep(1)
+
+    if buffer:
+        _save_analyses(buffer, 'initial', batch_num=0)
+        total_saved += len(buffer)
+
+    _score_and_save([], all_new, 'initial_analysis')
+
+    duration = time.time() - start
+    tg.send_message(
+        f"📅 <b>히스토리 확장 완료</b>\n\n"
+        f"📺 신규 영상: {len(all_new)}개\n"
+        f"💾 분석 저장: {total_saved}개\n"
+        f"⏱️ {duration/60:.1f}분"
+    )
+    print(f"\n✅ 히스토리 확장 완료 ({len(all_new)}개, {duration/60:.1f}분)")
+
+
 def run_comment_backfill():
     """
     initial_analysis 전체에서 emotion_temperature 없는 영상 댓글 재분석.
@@ -1208,6 +1312,9 @@ if __name__ == "__main__":
         run_thumbnail_backfill()
     elif mode == "full-backfill":
         run_full_backfill()
+    elif mode == "history-extend":
+        months = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+        run_history_extend(extra_months=months)
     elif mode == "comment-backfill":
         run_comment_backfill()
     # 구버전 호환

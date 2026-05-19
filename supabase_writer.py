@@ -979,6 +979,26 @@ def get_emotion_summary(days_back: int = 7) -> dict:
         return {}
 
 
+def get_oldest_video_date_by_channel(channel_title: str):
+    """채널별 이미 수집된 영상 중 가장 오래된 published_at 반환 (history-extend용)"""
+    client = get_client()
+    if not client:
+        return None
+    try:
+        from datetime import timezone
+        result = client.table('videos').select('published_at')\
+            .eq('channel_title', channel_title)\
+            .order('published_at').limit(1).execute()
+        if result.data:
+            raw = result.data[0]['published_at']
+            dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        return None
+    except Exception as e:
+        print(f"  ⚠️ oldest date 조회 실패 ({channel_title}): {e}")
+        return None
+
+
 def get_unanalyzed_videos(limit: int = None) -> list:
     """
     videos 테이블에 있지만 initial_analysis가 없는 영상 목록 반환.
