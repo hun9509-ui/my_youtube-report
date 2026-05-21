@@ -131,12 +131,17 @@ def analyze_comments(video_title, comments):
   "this_video_special": "댓글에서 읽히는 이 영상만의 특별한 이유",
   "revisit_intent": 0,
   "viral_signals": "공유·추천·감동 관련 댓글 패턴 (없으면 없음)",
+  "ad_boost_suspected": false,
+  "ad_boost_score": 0,
+  "ad_boost_signals": ["광고 관련 댓글 패턴 또는 이상 신호 (없으면 빈 배열)"],
   "summary": "전반적인 여론 한 줄 요약"
 }}
 
 - emotion_temperature 각 항목: 해당 감정을 드러내는 댓글 비율 추정값 (0~100 정수)
 - algorithm_discovery_rate: "알고리즘 타고 왔어요", "추천 떠서", "처음 봤는데" 등 신규 유입 패턴 댓글 비율 (0~100 정수)
 - revisit_intent: 재방문/재구독/공유 의사 비율 (0~100 정수)
+- ad_boost_score: 광고 부스팅 의심 점수 (0~100). "광고로 봤어요", "광고에서 봤어요", "왜 뜨는 거야", "피드에 갑자기" 등 댓글 패턴 + 반응 냉담(조회수 대비 댓글 내용 피상적) 정도 기반
+- ad_boost_suspected: ad_boost_score 40 이상이면 true
 JSON만 반환하세요.
 """
     return call_deepseek(prompt, complex_task=False)

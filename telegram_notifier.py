@@ -2,7 +2,6 @@
 텔레그램 봇으로 알림 전송하는 모듈
 """
 import requests
-import json
 import config
 
 
@@ -62,6 +61,25 @@ def send_daily_trend_alert(trend_summary):
 📊 자세한 내용은 구글 시트에서 확인
 """
     return send_message(message.strip())
+
+
+def send_ad_boost_summary(summary: list):
+    """채널별 광고 부스팅 의심 현황 알림"""
+    if not summary:
+        send_message("📢 광고 분석: 데이터 없음")
+        return
+
+    msg = "📢 <b>채널별 광고 부스팅 의심 현황</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+    for s in summary:
+        rate = s.get('ad_rate_pct', 0)
+        icon = "🔴" if rate >= 50 else "🟡" if rate >= 20 else "🟢"
+        msg += (
+            f"{icon} <b>{s.get('channel_title', '')}</b>\n"
+            f"   광고 의심 {s.get('ad_suspected_count', 0)}/{s.get('total_videos', 0)}개 "
+            f"({rate}%) | 평균 점수 {s.get('avg_ad_score', 0)}\n"
+        )
+    msg += "\n🟢 20% 미만: 유기 성장  🟡 20~50%: 부분 광고  🔴 50%+: 광고 의존"
+    send_message(msg)
 
 
 def send_weekly_report_alert(report, top_priority=None, market_state=None):

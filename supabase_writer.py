@@ -120,6 +120,8 @@ def save_initial_analysis(analyses, batch_num):
             'deepseek_raw': {**comments, '_version': config.ANALYSIS_VERSION},
             'is_hit': a.get('is_hit', False),
             'channel_avg_views': a.get('channel_avg_views', 0),
+            'ad_boost_suspected': comments.get('ad_boost_suspected', False),
+            'ad_boost_score': comments.get('ad_boost_score', 0),
         })
 
     try:
@@ -169,6 +171,8 @@ def save_daily_analysis(analyses):
             'comments_summary': comments.get('summary', ''),
             'gemini_raw': {**gemini, '_version': config.ANALYSIS_VERSION},
             'deepseek_raw': {**comments, '_version': config.ANALYSIS_VERSION},
+            'ad_boost_suspected': comments.get('ad_boost_suspected', False),
+            'ad_boost_score': comments.get('ad_boost_score', 0),
         })
 
     try:
@@ -1055,7 +1059,7 @@ def get_videos_needing_comment_reanalysis(limit: int = None) -> list:
 
 
 def update_comment_analysis(video_id: str, comments_result: dict) -> bool:
-    """initial_analysis의 deepseek_raw를 새 댓글 분석 결과로 갱신 (기존 필드 보존)"""
+    """initial_analysis의 deepseek_raw + ad_boost 컬럼을 새 댓글 분석 결과로 갱신"""
     client = get_client()
     if not client:
         return False
@@ -1064,12 +1068,55 @@ def update_comment_analysis(video_id: str, comments_result: dict) -> bool:
             .eq('video_id', video_id).limit(1).execute()
         existing = (res.data[0].get('deepseek_raw') or {}) if res.data else {}
         merged = {**existing, **comments_result, '_version': config.ANALYSIS_VERSION}
-        client.table('initial_analysis').update({'deepseek_raw': merged})\
-            .eq('video_id', video_id).execute()
+        client.table('initial_analysis').update({
+            'deepseek_raw': merged,
+            'ad_boost_suspected': comments_result.get('ad_boost_suspected', False),
+            'ad_boost_score': comments_result.get('ad_boost_score', 0),
+        }).eq('video_id', video_id).execute()
         return True
     except Exception as e:
         print(f"  ⚠️ update_comment_analysis 실패 ({video_id[:8]}...): {e}")
         return False
+
+
+def get_channel_ad_boost_summary() -> list:
+    """
+    채널별 광고 부스팅 의심 영상 비율 집계.
+    반환: [{channel_title, total, ad_suspected, ad_rate_pct, avg_ad_score}, ...]
+    """
+    client = get_client()
+    if not client:
+        return []
+    try:
+        rows = client.table('initial_analysis')\
+            .select('video_id, ad_boost_suspected, ad_boost_score, videos(channel_title)')\
+            .execute().data
+
+        from collections import defaultdict
+        ch: dict[str, dict] = defaultdict(lambda: {'total': 0, 'suspected': 0, 'score_sum': 0})
+        for r in rows:
+            ct = (r.get('videos') or {}).get('channel_title', '알 수 없음')
+            ch[ct]['total'] += 1
+            if r.get('ad_boost_suspected'):
+                ch[ct]['suspected'] += 1
+            ch[ct]['score_sum'] += r.get('ad_boost_score') or 0
+
+        result = []
+        for channel, d in ch.items():
+            total = d['total']
+            if total == 0:
+                continue
+            result.append({
+                'channel_title': channel,
+                'total_videos': total,
+                'ad_suspected_count': d['suspected'],
+                'ad_rate_pct': round(d['suspected'] / total * 100, 1),
+                'avg_ad_score': round(d['score_sum'] / total, 1),
+            })
+        return sorted(result, key=lambda x: x['ad_rate_pct'], reverse=True)
+    except Exception as e:
+        print(f"  ⚠️ ad_boost 채널 요약 실패: {e}")
+        return []
 
 
 def update_growth_patterns(video_ids: list = None) -> int:

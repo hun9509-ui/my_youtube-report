@@ -1257,6 +1257,12 @@ def run_weekly_report():
 
         top_priority = db.get_top_priority_videos(limit=5)
         tg.send_weekly_report_alert(report, top_priority, market_state)
+
+        # 채널별 광고 현황
+        ad_summary = db.get_channel_ad_boost_summary()
+        if ad_summary:
+            tg.send_ad_boost_summary(ad_summary)
+
         print("✅ 주간 채널 리포트 완료")
     except Exception as e:
         print(f"❌ 주간 리포트 오류: {e}")
