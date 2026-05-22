@@ -3,7 +3,7 @@ Supabase 이중 저장 모듈
 시트와 동일한 데이터를 PostgreSQL DB에도 저장
 """
 from supabase import create_client, Client
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import config
 
 
@@ -981,6 +981,63 @@ def get_emotion_summary(days_back: int = 7) -> dict:
     except Exception as e:
         print(f"  ⚠️ 감정 온도 집계 실패: {e}")
         return {}
+
+
+def get_own_videos_within_hours(hours: int = 24) -> list:
+    """업로드 후 N시간 이내 자체 채널 영상 목록"""
+    client = get_client()
+    if not client:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        result = client.table('own_channel_videos')\
+            .select('video_id,title,published_at,video_type,view_count')\
+            .gte('published_at', cutoff)\
+            .execute()
+        return result.data
+    except Exception as e:
+        print(f"  ⚠️ 최근 자체채널 영상 조회 실패: {e}")
+        return []
+
+
+def get_last_hourly_snapshot(video_id: str) -> dict | None:
+    """마지막 시간별 스냅샷 조회"""
+    client = get_client()
+    if not client:
+        return None
+    try:
+        result = client.table('own_channel_hourly_snapshots')\
+            .select('view_count,like_count,comment_count,hours_since_upload')\
+            .eq('video_id', video_id)\
+            .order('hours_since_upload', desc=True)\
+            .limit(1).execute()
+        return result.data[0] if result.data else None
+    except Exception:
+        return None
+
+
+def save_hourly_snapshot(video_id: str, hours: float, stats: dict, prev: dict | None) -> bool:
+    """시간별 스냅샷 저장"""
+    client = get_client()
+    if not client:
+        return False
+    prev_views = prev['view_count'] if prev else 0
+    prev_likes = prev['like_count'] if prev else 0
+    try:
+        client.table('own_channel_hourly_snapshots').upsert({
+            'video_id': video_id,
+            'snapshot_at': datetime.now(timezone.utc).isoformat(),
+            'hours_since_upload': round(hours, 2),
+            'view_count': stats.get('view_count', 0),
+            'like_count': stats.get('like_count', 0),
+            'comment_count': stats.get('comment_count', 0),
+            'view_growth': stats.get('view_count', 0) - prev_views,
+            'like_growth': stats.get('like_count', 0) - prev_likes,
+        }, on_conflict='video_id,hours_since_upload').execute()
+        return True
+    except Exception as e:
+        print(f"  ⚠️ hourly snapshot 저장 실패 ({video_id[:8]}...): {e}")
+        return False
 
 
 def get_oldest_video_date_by_channel(channel_title: str):

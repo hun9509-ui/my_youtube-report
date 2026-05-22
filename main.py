@@ -439,6 +439,54 @@ def run_trend_weekly():
 # 모드 5: 자체 채널 새 영상 분석
 # ───────────────────────────────────────────────
 
+def run_own_channel_hourly_snapshot():
+    """
+    업로드 후 24시간 이내 자체 채널 영상 시간별 스냅샷.
+    새 영상 없으면 즉시 종료 (API 소모 없음).
+    """
+    targets = db.get_own_videos_within_hours(hours=24)
+    if not targets:
+        print("📭 24시간 이내 자체 채널 신규 영상 없음 — skip")
+        return
+
+    print(f"⏱️ 시간별 스냅샷 대상: {len(targets)}개")
+
+    video_ids = [v['video_id'] for v in targets]
+    fresh_list = yt.get_video_details(video_ids, min_duration=0)
+    fresh_map = {v['video_id']: v for v in fresh_list}
+
+    for target in targets:
+        video_id = target['video_id']
+        fresh = fresh_map.get(video_id)
+        if not fresh:
+            continue
+
+        try:
+            pub = datetime.fromisoformat(
+                str(target['published_at']).replace('Z', '+00:00')
+            )
+            hours = (datetime.now(timezone.utc) - pub).total_seconds() / 3600
+        except Exception:
+            hours = 0
+
+        prev = db.get_last_hourly_snapshot(video_id)
+        db.save_hourly_snapshot(video_id, hours, fresh, prev)
+
+        view_growth = fresh.get('view_count', 0) - (prev['view_count'] if prev else 0)
+        vtype = '숏츠' if target.get('video_type') == 'shorts' else '롱폼'
+        print(f"  📸 [{vtype}] {target['title'][:40]} | {hours:.1f}h | +{view_growth:,}회")
+
+        # 초기 급등 감지: 6시간 이내 + 시간당 5천 이상
+        if hours <= 6 and view_growth >= 5000:
+            tg.send_message(
+                f"🚀 <b>초기 급등 감지!</b>\n\n"
+                f"📺 {target['title']}\n"
+                f"⏰ 업로드 후 {hours:.1f}시간\n"
+                f"📈 이번 시간 +{view_growth:,}회\n"
+                f"👁 누적 {fresh.get('view_count', 0):,}회"
+            )
+
+
 def run_own_channel_daily():
     """자체 채널 새 영상 감지 + 즉시 분석 (숏츠 포함)"""
     print(f"📺 자체 채널 분석 시작 ({datetime.now()})")
@@ -1298,6 +1346,8 @@ if __name__ == "__main__":
         run_trend_weekly()
     elif mode == "weekly":
         run_weekly_report()
+    elif mode == "own-hourly":
+        run_own_channel_hourly_snapshot()
     elif mode == "own-channel":
         run_own_channel_daily()
     elif mode == "own-track":
