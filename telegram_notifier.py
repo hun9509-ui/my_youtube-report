@@ -234,8 +234,8 @@ def send_irregular_alert(video: dict):
  
     msg = (
         f"⚡ <b>이레귤러 감지!</b>\n\n"
-        f"📺 <b>{video.get('title', '')}</b>\n"
-        f"📻 채널: {video.get('channel_title', '')}\n\n"
+        f"📺 <b>{escape(video.get('title', ''))}</b>\n"
+        f"📻 채널: {escape(video.get('channel_title', ''))}\n\n"
         f"📊 <b>지표</b>\n"
     )
  
@@ -254,7 +254,7 @@ def send_irregular_alert(video: dict):
  
     msg += f"\n🔗 https://www.youtube.com/watch?v={video.get('video_id', '')}"
  
-    send_message(msg)
+    return send_message(msg)
  
  
 def send_own_channel_alert(video: dict, gemini: dict, comments: dict):
@@ -329,7 +329,7 @@ def send_weekly_trend_alert(weekly_data: dict):
     # 사건 키워드
     if event_kws:
         msg += "🔑 <b>이번 주 핵심 키워드</b>\n"
-        msg += " ".join([f"#{k}" for k in event_kws[:8]])
+        msg += " ".join(f"#{escape(k)}" for k in event_kws[:8])
         msg += "\n\n"
  
     # 트랙 A
@@ -338,7 +338,7 @@ def send_weekly_trend_alert(weekly_data: dict):
         for i, v in enumerate(track_a[:5], 1):
             title = v.get('title', '')[:35]
             views = v.get('view_count', 0)
-            msg += f"  {i}. [{v.get('channel_title','')}] {title}\n"
+            msg += f"  {i}. [{escape(v.get('channel_title',''))}] {escape(title)}\n"
             msg += f"     조회수 {views:,}회\n"
     else:
         msg += "  (해당 영상 없음)\n"
@@ -350,9 +350,9 @@ def send_weekly_trend_alert(weekly_data: dict):
         for i, v in enumerate(track_b[:5], 1):
             title = v.get('title', '')[:35]
             views = v.get('view_count', 0)
-            msg += f"  {i}. [{v.get('channel_title','')}] {title}\n"
+            msg += f"  {i}. [{escape(v.get('channel_title',''))}] {escape(title)}\n"
             msg += f"     조회수 {views:,}회\n"
     else:
         msg += "  (해당 영상 없음)\n"
  
-    send_message(msg)
+    return send_message(msg)

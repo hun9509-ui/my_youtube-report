@@ -297,13 +297,14 @@ def save_trend_classified(classified: dict) -> int:
     """트렌드 분류 결과를 Supabase에 저장"""
     client = get_client()
     if not client:
-        return 0
+        raise RuntimeError("Supabase 연결 설정 누락")
  
-    today = datetime.now().date().isoformat()
+    today = datetime.now(config.KST).date().isoformat()
     rows = []
  
     def _to_row(v, track):
         return {
+            'processing_key': f"{today}:{track}:{v['video_id']}",
             'analysis_date': today,
             'track': track,
             'video_id': v.get('video_id', ''),
@@ -327,25 +328,18 @@ def save_trend_classified(classified: dict) -> int:
     for v in classified.get('irregular', []):
         rows.append(_to_row(v, 'IRREGULAR'))
  
-    if not rows:
-        return 0
- 
-    try:
-        client.table('trend_classified').insert(rows).execute()
- 
-        # 사건 키워드 별도 저장
-        event_kws = classified.get('event_keywords', [])
-        if event_kws:
-            client.table('event_keywords').insert({
-                'analysis_date': today,
-                'keywords': event_kws,
-            }).execute()
- 
-        print(f"  💾 Supabase: trend_classified {len(rows)}개 저장")
-        return len(rows)
-    except Exception as e:
-        print(f"  ⚠️ Supabase trend_classified 저장 실패: {e}")
-        return 0
+    saved = 0
+    if rows:
+        result = client.table('trend_classified').upsert(rows, on_conflict='processing_key').execute()
+        saved = len(result.data)
+    event_kws = classified.get('event_keywords', [])
+    if event_kws:
+        result = client.table('event_keywords').upsert({
+            'processing_key': today, 'analysis_date': today, 'keywords': event_kws,
+        }, on_conflict='processing_key').execute()
+        if len(result.data) != 1:
+            raise RuntimeError("트렌드 키워드 저장 건수 불일치")
+    return saved
  
  
 # ───────────────────────────────────────────────
@@ -690,9 +684,11 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
     """지난 N일간 트렌드 데이터 종합 (월요일 알림용)"""
     client = get_client()
     if not client:
-        return {}
+        raise RuntimeError("Supabase 연결 설정 누락")
  
-    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+    today = datetime.now(config.KST).date()
+    end = today - timedelta(days=today.weekday())
+    cutoff = (end - timedelta(days=days_back)).isoformat()
  
     try:
         # 트랙별 TOP 영상 — 많이 가져와서 video_id 기준 중복 제거 후 TOP 10
@@ -700,6 +696,7 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
             .select('*') \
             .eq('track', 'A') \
             .gte('analysis_date', cutoff) \
+            .lt('analysis_date', end.isoformat()) \
             .order('view_count', desc=True) \
             .limit(100) \
             .execute()
@@ -708,6 +705,7 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
             .select('*') \
             .eq('track', 'B') \
             .gte('analysis_date', cutoff) \
+            .lt('analysis_date', end.isoformat()) \
             .order('view_count', desc=True) \
             .limit(100) \
             .execute()
@@ -727,6 +725,7 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
         kw_data = client.table('event_keywords') \
             .select('keywords') \
             .gte('analysis_date', cutoff) \
+            .lt('analysis_date', end.isoformat()) \
             .execute()
  
         from collections import Counter
@@ -744,8 +743,7 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
             'period_days': days_back,
         }
     except Exception as e:
-        print(f"  ⚠️ 주간 트렌드 조회 실패: {e}")
-        return {}
+        raise RuntimeError(f"주간 트렌드 조회 실패: {safe_error(e)}") from e
 
 
 def get_all_tracked_video_ids() -> list:

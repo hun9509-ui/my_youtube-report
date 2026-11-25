@@ -26,6 +26,36 @@ def video(video_id, days=0):
     }
 
 
+class TrendTests(unittest.TestCase):
+    def test_failed_categories_do_not_publish_empty_results(self):
+        with patch.object(config, "TRENDING_CATEGORIES", {"A": "1"}), \
+                patch.object(main.yt, "get_trending_videos", side_effect=RuntimeError("quota")), \
+                patch.object(main.db, "save_trend_classified") as save, \
+                patch.object(main.tg, "send_error_alert") as alert:
+            self.assertFalse(main.run_trend_collect())
+            save.assert_not_called()
+            alert.assert_called_once()
+
+    def test_partial_collection_keeps_available_results_and_signals_failure(self):
+        with patch.object(config, "TRENDING_CATEGORIES", {"A": "1", "B": "2"}), \
+                patch.object(main.yt, "get_trending_videos", side_effect=[[video("김치 레시피")], RuntimeError("quota")]), \
+                patch.object(main.db, "save_trend_classified", side_effect=lambda data: sum(len(data[k]) for k in ("track_a", "track_b", "irregular"))) as save, \
+                patch.object(main.sheets, "save_trend_classified"), patch.object(main.tg, "send_error_alert"):
+            self.assertFalse(main.run_trend_collect())
+            save.assert_called_once()
+
+    def test_unconfirmed_weekly_delivery_is_reported(self):
+        weekly = {"track_a": [{"title": "<A>", "channel_title": "B&C"}], "track_b": [], "event_keywords": []}
+        with patch.object(main.db, "get_weekly_trend_summary", return_value=weekly), \
+                patch.object(main.tg, "send_message", return_value=False) as send:
+            self.assertFalse(main.run_trend_weekly())
+            self.assertIn("&lt;A&gt;", send.call_args.args[0])
+
+    def test_future_and_naive_dates_do_not_trigger_alerts(self):
+        for stamp in ("2199-01-01T00:00:00Z", "2026-01-01T00:00:00"):
+            self.assertFalse(main.tc.detect_irregular({"published_at": stamp, "view_count": 999999})["is_irregular"])
+
+
 class DailyPipelineTests(unittest.TestCase):
     def setUp(self):
         self.db = Mock()

@@ -15,29 +15,21 @@
   python main.py growth-pattern       : 성장 패턴 분류 업데이트
 """
 import sys
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-print("=" * 60, flush=True)
-print("🎬 한고은 채널 분석 시스템 시작", flush=True)
-print("=" * 60, flush=True)
-
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from analysis_schema import CommentAnalysis, MarketAnalysis, WeeklyReport
 from gemini_client import has_text, safe_error
 
-print("⏳ 모듈 import 중...", flush=True)
-import config;                  print("  ✓ config", flush=True)
-import youtube_collector as yt; print("  ✓ youtube_collector", flush=True)
-import gemini_analyzer as gemini; print("  ✓ gemini_analyzer", flush=True)
-import deepseek_processor as ds; print("  ✓ deepseek_processor", flush=True)
-import sheets_writer as sheets; print("  ✓ sheets_writer", flush=True)
-import supabase_writer as db;   print("  ✓ supabase_writer", flush=True)
-import telegram_notifier as tg; print("  ✓ telegram_notifier", flush=True)
-import trend_classifier as tc;  print("  ✓ trend_classifier", flush=True)
-import strategy_scorer as scorer; print("  ✓ strategy_scorer", flush=True)
+import config
+import youtube_collector as yt
+import gemini_analyzer as gemini
+import deepseek_processor as ds
+import sheets_writer as sheets
+import supabase_writer as db
+import telegram_notifier as tg
+import trend_classifier as tc
+import strategy_scorer as scorer
 
 def validate_env(mode):
     required = {
@@ -424,25 +416,20 @@ def run_trend_collect():
     try:
         # 1. 트렌드 영상 수집
         all_trending = []
+        failures = []
         for cat_name, cat_id in config.TRENDING_CATEGORIES.items():
             try:
                 videos = yt.get_trending_videos(category_id=cat_id, max_results=30)
                 all_trending.extend(videos)
             except Exception as e:
-                print(f"카테고리 {cat_name} 수집 실패: {e}")
+                failures.append(f"{cat_name} 수집 실패: {safe_error(e)}")
+
+        if len(failures) == len(config.TRENDING_CATEGORIES):
+            raise RuntimeError("전체 트렌드 카테고리 수집 실패 " + ", ".join(failures))
 
         unique = list({v["video_id"]: v for v in all_trending}.values())
         unique = sorted(unique, key=lambda x: x.get("view_count", 0), reverse=True)[:50]
         print(f"📊 수집된 영상: {len(unique)}개")
-
-        # 2. 영상별 상세 정보 보강 (published_at 등 정확하게)
-        if unique:
-            video_ids = [v["video_id"] for v in unique]
-            detailed = yt.get_video_details(video_ids)
-            # 트렌딩 정보 + 상세 정보 병합
-            detail_map = {v["video_id"]: v for v in detailed}
-            unique = [detail_map.get(v["video_id"], v) for v in unique]
-            unique = [v for v in unique if v.get("video_id")]
 
         # 3. 트랙 분류 + 이레귤러 감지
         classified = tc.classify_videos(unique)
@@ -451,23 +438,29 @@ def run_trend_collect():
               f"⚡ 이레귤러: {len(classified['irregular'])}개")
 
         # 4. 시트/DB 저장 (월요일 종합용 누적)
+        expected = sum(len(classified[key]) for key in ("track_a", "track_b", "irregular"))
+        if db.save_trend_classified(classified) != expected:
+            raise RuntimeError("분류 결과 저장 건수 불일치")
         sheets.save_trend_classified(classified)
-        db.save_trend_classified(classified)
 
         # 5. 이레귤러 즉시 알림
         if classified["irregular"]:
             for video in classified["irregular"]:
-                tg.send_irregular_alert(video)
+                if not tg.send_irregular_alert(video):
+                    failures.append(f"{video['video_id']} 급상승 알림 발송 실패")
                 time.sleep(0.5)
-            print(f"⚡ 이레귤러 알림 {len(classified['irregular'])}건 발송")
 
+        if failures:
+            raise RuntimeError(" / ".join(failures))
         duration = time.time() - start
         print(f"✅ 트렌드 수집 완료 ({duration:.0f}초)")
+        return True
 
     except Exception as e:
-        print(f"❌ 트렌드 수집 오류: {e}")
-        traceback.print_exc()
-        tg.send_error_alert(str(e), "트렌드 수집")
+        error = safe_error(e)
+        print(f"❌ 트렌드 수집 오류: {error}")
+        tg.send_error_alert(error, "트렌드 수집")
+        return False
 
 
 # ───────────────────────────────────────────────
@@ -486,19 +479,18 @@ def run_trend_weekly():
         # 지난 7일간 누적된 트렌드 데이터 조회
         weekly_data = db.get_weekly_trend_summary(days_back=7)
 
-        if not weekly_data:
+        if not any(weekly_data[k] for k in ("track_a", "track_b", "event_keywords")):
             print("⚠️ 주간 데이터 없음")
-            tg.send_message("⚠️ 이번 주 트렌드 데이터 부족")
-            return
+            return tg.send_message("⚠️ 이번 주 트렌드 데이터 부족")
 
         # 트랙별 TOP + 사건 키워드
-        tg.send_weekly_trend_alert(weekly_data)
-        print("✅ 주간 트렌드 알림 발송 완료")
+        return tg.send_weekly_trend_alert(weekly_data)
 
     except Exception as e:
-        print(f"❌ 주간 트렌드 오류: {e}")
-        traceback.print_exc()
-        tg.send_error_alert(str(e), "주간 트렌드")
+        error = safe_error(e)
+        print(f"❌ 주간 트렌드 오류: {error}")
+        tg.send_error_alert(error, "주간 트렌드")
+        return False
 
 
 # ───────────────────────────────────────────────
@@ -1403,6 +1395,8 @@ def run_weekly_report():
 # ───────────────────────────────────────────────
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", line_buffering=True)
     if len(sys.argv) < 2:
         print("사용법: python main.py [initial-batch N|daily|trend-collect|trend-weekly|weekly]")
         sys.exit(1)
@@ -1423,9 +1417,9 @@ if __name__ == "__main__":
     elif mode == "daily":
         sys.exit(0 if run_daily_collection() else 1)
     elif mode == "trend-collect":
-        run_trend_collect()
+        sys.exit(0 if run_trend_collect() else 1)
     elif mode == "trend-weekly":
-        run_trend_weekly()
+        sys.exit(0 if run_trend_weekly() else 1)
     elif mode == "weekly":
         sys.exit(0 if run_weekly_report() else 1)
     elif mode == "own-hourly":
@@ -1458,7 +1452,7 @@ if __name__ == "__main__":
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")
-        run_trend_collect()
+        sys.exit(0 if run_trend_collect() else 1)
     else:
         print(f"❌ 알 수 없는 모드: {mode}")
         sys.exit(1)

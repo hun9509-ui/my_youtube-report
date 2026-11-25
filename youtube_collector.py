@@ -238,6 +238,7 @@ def get_trending_videos(category_id="0", region="KR", max_results=50):
         trending.append({
             'video_id': item['id'],
             'title': snippet.get('title', ''),
+            'description': snippet.get('description', '')[:500],
             'channel_title': snippet.get('channelTitle', ''),
             'published_at': snippet.get('publishedAt', ''),
             'view_count': int(stats.get('viewCount', 0)),

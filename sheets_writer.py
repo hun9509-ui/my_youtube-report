@@ -375,7 +375,7 @@ def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
 
 
 def save_trend_classified(classified: dict) -> int:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(config.KST).date().isoformat()
     rows = []
 
     def _to_row(v, track):
