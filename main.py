@@ -25,6 +25,8 @@ print("=" * 60, flush=True)
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from analysis_schema import CommentAnalysis, MarketAnalysis, WeeklyReport
+from gemini_client import has_text, safe_error
 
 print("⏳ 모듈 import 중...", flush=True)
 import config;                  print("  ✓ config", flush=True)
@@ -37,24 +39,24 @@ import telegram_notifier as tg; print("  ✓ telegram_notifier", flush=True)
 import trend_classifier as tc;  print("  ✓ trend_classifier", flush=True)
 import strategy_scorer as scorer; print("  ✓ strategy_scorer", flush=True)
 
-# ── 환경변수 체크 ──────────────────────────────
-print("\n⏳ 환경변수 체크 중...", flush=True)
-required = {
-    'YOUTUBE_API_KEY':    config.YOUTUBE_API_KEY,
-    'TELEGRAM_BOT_TOKEN': config.TELEGRAM_BOT_TOKEN,
-    'TELEGRAM_CHAT_ID':   config.TELEGRAM_CHAT_ID,
-}
-if getattr(config, 'TEXT_ANALYSIS_ENGINE', 'deepseek') == 'deepseek':
-    required['DEEPSEEK_API_KEY'] = config.DEEPSEEK_API_KEY
-missing = [k for k, v in required.items() if not v]
-if missing:
-    print(f"❌ 누락된 환경변수: {missing}", flush=True)
-    sys.exit(1)
-
-if config.SUPABASE_URL and config.SUPABASE_KEY:
-    print("  ✓ 모든 환경변수 정상 (Supabase 포함)", flush=True)
-else:
-    print("  ⚠️ Supabase 미설정 → 시트만 저장됩니다", flush=True)
+def validate_env(mode):
+    required = {
+        "YOUTUBE_API_KEY": config.YOUTUBE_API_KEY,
+        "TELEGRAM_BOT_TOKEN": config.TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHAT_ID": config.TELEGRAM_CHAT_ID,
+    }
+    if config.TEXT_ANALYSIS_ENGINE == "deepseek":
+        required["DEEPSEEK_API_KEY"] = config.DEEPSEEK_API_KEY
+    if config.TEXT_ANALYSIS_ENGINE not in {"gemini", "deepseek"}:
+        print("❌ TEXT_ANALYSIS_ENGINE은 gemini 또는 deepseek이어야 합니다")
+        return False
+    if mode in {"daily", "weekly", "trend", "trend-collect", "trend-weekly", "snapshot-collect"}:
+        required["SUPABASE_URL"] = config.SUPABASE_URL
+        required["SUPABASE_KEY"] = config.SUPABASE_KEY
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        print(f"❌ 누락된 환경변수: {', '.join(missing)}")
+    return not missing
 
 
 # ───────────────────────────────────────────────
@@ -69,13 +71,14 @@ def collect_channel(channel_name: str, months_back: int = 6) -> list[dict]:
 
     channel_id = config.TARGET_CHANNELS.get(channel_name)
     if not channel_id:
-        print(f"❌ config에서 채널 ID 없음: {channel_name}")
-        return []
+        raise ValueError(f"채널 ID 미설정 ({channel_name})")
 
     print(f"✅ 채널 ID: {channel_id}")
     
     # 1. 포장지 분해: 영상 목록(raw_videos)과 채널 정보(channel_info)를 따로 받기
     raw_videos, channel_info = yt.get_channel_videos(channel_id, months_back=months_back)
+    if not channel_info:
+        raise RuntimeError(f"YouTube 채널 조회 결과 없음 ({channel_name})")
     
     if not raw_videos:
         print("📹 수집된 기본 영상 없음")
@@ -99,15 +102,19 @@ def analyze_video_complete(video: dict, gemini_result: dict) -> dict:
         try:
             comments = yt.get_video_comments(
                 video["video_id"],
-                max_comments=config.TOP_COMMENTS_COUNT
+                max_comments=config.TOP_COMMENTS_COUNT,
+                raise_on_error=True,
             )
             if comments:
                 comments_analysis = ds.analyze_comments(video["title"], comments)
+                if "error" not in comments_analysis:
+                    comments_analysis = CommentAnalysis.model_validate(comments_analysis).model_dump()
             else:
                 comments_analysis = {"skipped": "댓글 수집 결과 없음"}
         except Exception as e:
-            print(f"  ⚠️ 댓글 분석 실패: {e}")
-            comments_analysis = {"error": str(e)}
+            error = safe_error(e)
+            print(f"  ⚠️ 댓글 분석 실패: {error}")
+            comments_analysis = {"error": error}
 
     return {
         "video_id": video["video_id"],
@@ -117,27 +124,36 @@ def analyze_video_complete(video: dict, gemini_result: dict) -> dict:
 
 
 def _save_analyses(analyses: list[dict], mode: str, batch_num: int = 0):
+    valid = [a for a in analyses if has_text(a.get("gemini"), "topic")]
+    if not valid:
+        return 0
     if mode == "initial":
-        sheets.save_initial_analysis(analyses, batch_num)
-        db.save_initial_analysis(analyses, batch_num)
-    else:
-        sheets.save_daily_analysis(analyses)
-        db.save_daily_analysis(analyses)
+        saved = db.save_initial_analysis(valid, batch_num)
+        if saved == len(valid):
+            sheets.save_initial_analysis(valid, batch_num)
+        return saved
+    saved = db.save_daily_analysis(valid)
+    if saved == len(valid):
+        sheets.save_daily_analysis(valid)
+    return saved
 
 
 def _score_and_save(analyses: list[dict], videos_list: list[dict], source_table: str):
     """분석 완료 후 전략 스코어 자동 생성 — 실패해도 분석 저장은 영향 없음"""
     try:
         videos_map = {v.get('video_id'): v for v in videos_list}
-        scores = scorer.score_batch(videos_map, analyses, source_table)
+        valid = [a for a in analyses if has_text(a.get("gemini"), "topic")]
+        scores = scorer.score_batch(videos_map, valid, source_table)
         if not scores:
-            return
-        db.save_video_scores(scores)
-        sheets.save_strategy_scores(scores, videos_map)
-        print(f"  📊 전략 스코어 {len(scores)}개 저장")
+            return 0
+        saved = db.save_video_scores(scores)
+        if saved == len(scores):
+            sheets.save_strategy_scores(scores, videos_map)
+        print(f"  📊 전략 스코어 {saved}/{len(scores)}개 저장")
+        return saved
     except Exception as e:
-        print(f"  ⚠️ 전략 스코어링 실패 (분석은 정상 저장됨): {e}")
-        tg.send_error_alert(str(e), "전략 스코어링")
+        print(f"  ⚠️ 전략 스코어링 실패: {safe_error(e)}")
+        return 0
 
 
 # ───────────────────────────────────────────────
@@ -222,14 +238,12 @@ def run_initial_batch(batch_num: int):
         print(f"  [{i+1}/{len(all_videos)}] {'⭐' if video.get('is_hit') else '  '} {video.get('title','')[:45]}")
 
         if len(buffer) >= 10:
-            _save_analyses(buffer, "initial", batch_num)
-            total_saved += len(buffer)
+            total_saved += _save_analyses(buffer, "initial", batch_num)
             print(f"  💾 중간 저장 ({total_saved}개 누적)")
             buffer = []
 
     if buffer:
-        _save_analyses(buffer, "initial", batch_num)
-        total_saved += len(buffer)
+        total_saved += _save_analyses(buffer, "initial", batch_num)
 
     print(f"\n✅ 분석 저장 완료: {total_saved}개")
 
@@ -283,61 +297,113 @@ def run_initial_batch(batch_num: int):
 # ───────────────────────────────────────────────
 
 def run_daily_collection():
-    print(f"🌙 일일 수집 시작 ({datetime.now()})")
-    start = time.time()
-    stats = {"new": 0, "analyzed": 0, "errors": 0}
-    all_new: list[dict] = []
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
-
+    now = datetime.now(config.KST)
+    cutoff = now - timedelta(days=config.DAILY_LOOKBACK_DAYS)
+    videos = {}
+    failed_channels = []
     for name in config.TARGET_CHANNELS:
         try:
-            videos = collect_channel(name, months_back=1)
-            new = [
-                v for v in videos
-                if datetime.fromisoformat(
-                    v["published_at"].replace("Z", "+00:00")
-                ) > cutoff
-            ]
-            all_new.extend(new)
-            time.sleep(1)
+            for video in collect_channel(name, months_back=1):
+                published_at = datetime.fromisoformat(video["published_at"].replace("Z", "+00:00"))
+                if published_at > cutoff:
+                    videos[video["video_id"]] = video
         except Exception as e:
-            print(f"❌ {name}: {e}")
-            stats["errors"] += 1
+            failed_channels.append(name)
+            print(f"❌ {name} 수집 실패: {safe_error(e)}")
 
-    if not all_new:
-        print("📭 새 영상 없음")
-        tg.send_message(f"📭 새 영상 없음 ({datetime.now().strftime('%m/%d')})")
-        return
+    stats = {
+        "후보 영상": len(videos), "영상 저장": 0, "기존 분석": 0,
+        "신규 분석 저장": 0, "Gemini 실패": 0, "댓글 실패": 0,
+        "댓글 복구": 0, "점수 저장": 0,
+    }
+    issues = []
+    if failed_channels:
+        issues.append("수집 실패 채널: " + ", ".join(failed_channels))
+    processing_failed = False
+    if videos:
+        try:
+            _process_daily_videos(videos, now.date(), stats, issues)
+        except Exception as exc:
+            processing_failed = True
+            issues.append(f"일일 처리 중단: {safe_error(exc)}")
 
-    sheets.save_videos(all_new)
-    db.save_videos(all_new)
-    stats["new"] = len(all_new)
+    all_channels_failed = len(failed_channels) == len(config.TARGET_CHANNELS)
+    all_analyses_failed = videos and not (stats["신규 분석 저장"] or stats["기존 분석"])
+    if all_channels_failed or processing_failed or all_analyses_failed:
+        status = "실패"
+    elif issues:
+        status = "부분 실패"
+    else:
+        status = "완료"
+    counts = " | ".join(f"{key} {value}" for key, value in stats.items())
+    message = "\n".join([f"일일 경쟁 채널 분석 {status} ({now:%Y-%m-%d} KST)", counts, *issues])
+    print(message)
+    delivered = tg.send_message(message, parse_mode=None)
+    return status == "완료" and delivered
 
-    print(f"\n🤖 Gemini 분석 ({len(all_new)}개)")
-    gemini_results = gemini.analyze_videos_batch(all_new, delay=5, model_mode='daily')
 
-    analyses: list[dict] = []
-    for video in all_new:
-        g_result = next(
-            (g for g in gemini_results if g.get("video_id") == video["video_id"]),
-            {"error": "Gemini 매칭 실패"}
-        )
-        analyses.append(analyze_video_complete(video, g_result))
-        stats["analyzed"] += 1
+def _process_daily_videos(videos, analysis_date, stats, issues):
+    existing, scored = db.get_daily_state(list(videos))
+    stats["기존 분석"] = len(existing)
+    stats["영상 저장"] = db.save_videos(list(videos.values()))
+    if stats["영상 저장"] != len(videos):
+        raise RuntimeError("Supabase 영상 저장 건수가 후보 건수와 다릅니다")
+    sheets.save_videos(list(videos.values()))
 
-    _save_analyses(analyses, "daily")
-    _score_and_save(analyses, all_new, 'daily_analysis')
+    pending = [video for video_id, video in videos.items() if video_id not in existing]
+    results = {}
+    if pending:
+        results = {row["video_id"]: row for row in gemini.analyze_videos_batch(pending)}
+    stats["Gemini 실패"] = sum(not has_text(results.get(v["video_id"]), "topic") for v in pending)
+    if stats["Gemini 실패"]:
+        issues.append("Gemini 분석 실패. 실행 로그에서 모델명과 API 오류를 확인하세요.")
 
-    duration = time.time() - start
-    tg.send_message(
-        f"✅ <b>일일 분석 완료</b>\n\n"
-        f"📺 새 영상: {stats['new']}개\n"
-        f"🤖 분석: {stats['analyzed']}개\n"
-        f"⚠️ 에러: {stats['errors']}개\n"
-        f"⏱️ 소요: {duration/60:.1f}분"
-    )
-    print("✅ 일일 수집 완료")
+    analyses = []
+    recovered_ids = set()
+    for video_id, video in videos.items():
+        prior = existing.get(video_id)
+        if prior:
+            if not prior.get("processing_key") or "error" not in (prior.get("deepseek_raw") or {}):
+                continue
+            result = analyze_video_complete(video, prior["gemini_raw"])
+            result["analysis_date"] = prior["analysis_date"]
+        else:
+            gemini_result = results.get(video_id)
+            if not has_text(gemini_result, "topic"):
+                continue
+            result = analyze_video_complete(video, gemini_result)
+
+        if "error" in result["comments"]:
+            stats["댓글 실패"] += 1
+            print(f"  ⚠️ 댓글 분석 실패 ({video_id}): {safe_error(result['comments']['error'])}")
+            if prior:
+                continue
+        elif prior:
+            recovered_ids.add(video_id)
+        analyses.append(result)
+
+    if stats["댓글 실패"]:
+        issues.append("일부 댓글 분석 실패. 유효한 영상 주제 분석을 저장합니다.")
+    if analyses:
+        saved = db.save_daily_analysis(analyses, analysis_date)
+        if saved != len(analyses):
+            raise RuntimeError("Supabase 일일 분석 저장 건수가 요청 건수와 다릅니다")
+        stats["댓글 복구"] = len(recovered_ids)
+        stats["신규 분석 저장"] = saved - len(recovered_ids)
+        sheets.save_daily_analysis(analyses, analysis_date)
+
+    candidates = {
+        video_id: {"video_id": video_id, "gemini": row["gemini_raw"],
+                   "comments": row.get("deepseek_raw") or {}}
+        for video_id, row in existing.items()
+    }
+    candidates.update((row["video_id"], row) for row in analyses)
+    scored.difference_update(row["video_id"] for row in analyses)
+    unscored = [row for video_id, row in candidates.items() if video_id not in scored]
+    if unscored:
+        stats["점수 저장"] = _score_and_save(unscored, list(videos.values()), "daily_analysis")
+        if stats["점수 저장"] != len(unscored):
+            issues.append("일부 전략 점수 저장 실패. 다음 실행에서 다시 시도합니다.")
 
 
 # ───────────────────────────────────────────────
@@ -797,9 +863,9 @@ def _build_snapshot(video_meta: dict, fresh: dict, prev: dict | None, today: str
     like_now  = fresh.get('like_count', 0)
     comm_now  = fresh.get('comment_count', 0)
 
-    prev_view = prev['view_count']  if prev else 0
-    prev_like = prev['like_count']  if prev else 0
-    prev_comm = prev['comment_count'] if prev else 0
+    prev_view = prev['view_count'] if prev else view_now
+    prev_like = prev['like_count'] if prev else like_now
+    prev_comm = prev['comment_count'] if prev else comm_now
 
     view_growth = view_now - prev_view
     like_growth = like_now - prev_like
@@ -832,7 +898,7 @@ def run_snapshot_collect():
     """
     print(f"📸 스냅샷 수집 시작 ({datetime.now()})")
     start = time.time()
-    today = datetime.now().date().isoformat()
+    today = datetime.now(config.KST).date().isoformat()
 
     all_metas = db.get_all_videos_for_snapshot()
     if not all_metas:
@@ -1240,21 +1306,17 @@ def run_comment_backfill():
 
 def run_weekly_report():
     print("📊 주간 채널 리포트 생성 시작")
+    today = datetime.now(config.KST).date()
+    report_date = today - timedelta(days=today.weekday())
     try:
         # 1. 성장 패턴 최신화
         print("  📈 성장 패턴 분류 중...")
         db.update_growth_patterns()
 
         # 2. 최신 stats 기준 영상 조회
-        recent = db.get_recent_videos_from_db(days_back=7)
+        recent = db.get_recent_videos_from_db(days_back=7, before=report_date)
         if not recent:
-            print("⚠️ 최근 7일 영상 없음 — 시트 fallback")
-            recent_raw = sheets.get_videos_from_sheet(days_back=7)
-            recent = [
-                {"channel_title": v.get("채널명",""), "title": v.get("제목",""),
-                 "view_count": int(v.get("조회수", 0) or 0)}
-                for v in recent_raw
-            ]
+            raise RuntimeError("지난주 경쟁 채널 영상 데이터가 없습니다")
 
         from collections import defaultdict
         ch_map: dict[str, list] = defaultdict(list)
@@ -1267,28 +1329,34 @@ def run_weekly_report():
         # 3. 채널별 성공공식
         insights: dict[str, dict] = {}
         for ch, vids in ch_map.items():
-            if len(vids) >= 3:
-                insights[ch] = ds.derive_channel_success_formula(ch, vids)
+            if len(vids) >= 5:
+                insight = ds.derive_channel_success_formula(ch, vids)
+                if has_text(insight, "success_formula"):
+                    insights[ch] = insight
                 time.sleep(2)
 
-        sheets.save_channel_insights(insights)
-        db.save_channel_insights(insights)
-
         top = sorted(
-            [{"title": v.get("title",""), "channel_title": v.get("channel_title",""),
+            [{"video_id": v["video_id"], "title": v.get("title",""), "channel_title": v.get("channel_title",""),
               "view_count": v.get("view_count", 0)} for v in recent],
             key=lambda x: x["view_count"], reverse=True
         )[:20]
 
         # 4. 기존 주간 리포트
         report = ds.generate_weekly_report(insights, top)
-        sheets.save_weekly_report(report)
-        db.save_weekly_report(report)
+        if not has_text(report, "week_summary"):
+            error = report.get("error") if isinstance(report, dict) else None
+            raise RuntimeError(error or "주간 리포트 요약이 비어 있습니다")
+        report = WeeklyReport.model_validate(report).model_dump()
+        if not db.save_weekly_report(report, report_date):
+            raise RuntimeError("Supabase 주간 리포트 저장을 확인하지 못했습니다")
+        sheets.save_weekly_report(report, report_date)
+        sheets.save_channel_insights(insights)
+        db.save_channel_insights(insights)
 
         # 5. 시장 변화 분석 (market intelligence)
         print("  🧠 시장 변화 분석 중...")
-        snapshot_summary = db.get_snapshot_growth_summary(days_back=7)
-        emotion_summary = db.get_emotion_summary(days_back=7)
+        snapshot_summary = db.get_snapshot_growth_summary(days_back=7, before=report_date)
+        emotion_summary = db.get_emotion_summary(days_back=7, before=report_date)
 
         # top 영상에 growth_pattern 병합
         snap_rows = snapshot_summary.get('top_growing', [])
@@ -1296,26 +1364,38 @@ def run_weekly_report():
         for v in top:
             v['growth_pattern'] = snap_map.get(v.get('video_id', ''), '')
 
-        market_state = ds.generate_market_intelligence(snapshot_summary, emotion_summary, top)
-        if 'error' not in market_state:
-            db.save_weekly_market_state(market_state)
-            print(f"  ✅ 시장 변화 분석 저장 완료")
+        if snapshot_summary.get("total_snapshots"):
+            market_state = ds.generate_market_intelligence(snapshot_summary, emotion_summary, top)
         else:
-            print(f"  ⚠️ 시장 분석 실패: {market_state.get('error')}")
+            market_state = {"error": "지난주 스냅샷 없음"}
+        if has_text(market_state, "market_summary"):
+            try:
+                market_state = MarketAnalysis.model_validate(market_state).model_dump()
+            except ValueError as exc:
+                market_state = {"error": safe_error(exc)}
+        market_saved = has_text(market_state, "market_summary") and db.save_weekly_market_state(market_state, report_date)
+        if not market_saved:
+            print(f"  ⚠️ 시장 변화 분석 미완료: {safe_error(market_state.get('error', '결과 검증 또는 저장 실패'))}")
 
         top_priority = db.get_top_priority_videos(limit=5)
-        tg.send_weekly_report_alert(report, top_priority, market_state)
+        delivered = tg.send_weekly_report_alert(
+            report, top_priority, market_state if market_saved else None, market_missing=not market_saved
+        )
 
         # 채널별 광고 현황
         ad_summary = db.get_channel_ad_boost_summary()
-        if ad_summary:
-            tg.send_ad_boost_summary(ad_summary)
-
+        if ad_summary and delivered:
+            delivered = tg.send_ad_boost_summary(ad_summary)
+        if not delivered or not market_saved:
+            print("⚠️ 주간 채널 리포트 부분 실패")
+            return False
         print("✅ 주간 채널 리포트 완료")
+        return True
     except Exception as e:
-        print(f"❌ 주간 리포트 오류: {e}")
-        traceback.print_exc()
-        tg.send_error_alert(str(e), "주간 리포트")
+        error = safe_error(e)
+        print(f"❌ 주간 리포트 오류: {error}")
+        tg.send_error_alert(error, "주간 리포트")
+        return False
 
 
 # ───────────────────────────────────────────────
@@ -1328,6 +1408,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     mode = sys.argv[1].lower()
+    if not validate_env(mode):
+        sys.exit(1)
 
     if mode == "initial-batch":
         if len(sys.argv) < 3:
@@ -1339,13 +1421,13 @@ if __name__ == "__main__":
             print(f"❌ 배치 번호는 정수: {sys.argv[2]}")
             sys.exit(1)
     elif mode == "daily":
-        run_daily_collection()
+        sys.exit(0 if run_daily_collection() else 1)
     elif mode == "trend-collect":
         run_trend_collect()
     elif mode == "trend-weekly":
         run_trend_weekly()
     elif mode == "weekly":
-        run_weekly_report()
+        sys.exit(0 if run_weekly_report() else 1)
     elif mode == "own-hourly":
         run_own_channel_hourly_snapshot()
     elif mode == "own-channel":

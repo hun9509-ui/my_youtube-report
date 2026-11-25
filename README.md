@@ -1,5 +1,13 @@
 # 한고은 채널 분석 시스템
 
+## 분석 엔진 개선 브랜치
+
+- 기존 Supabase 프로젝트에서 일일·주간 결과의 중복 방지 키를 사용하려면, 별도 검증 DB에 `DATABASE_URL`을 설정하고 `python db_migrate.py`를 먼저 실행합니다. 기존 기록은 유지됩니다. 마이그레이션 실행에는 `psycopg2-binary`가 필요합니다.
+- 영상 분석은 Google Cloud 애플리케이션 기본 인증(ADC)을 사용합니다. 기본 모델은 `gemini-3.5-flash`이며, `GEMINI_MODEL` 또는 `GEMINI_DAILY_MODEL`·`GEMINI_TEXT_MODEL`·`GEMINI_VISION_MODEL`로 조정할 수 있습니다.
+- 댓글·주간 텍스트 분석에 DeepSeek를 사용하려면 `TEXT_ANALYSIS_ENGINE=deepseek`와 `DEEPSEEK_API_KEY`를 설정합니다. `DEEPSEEK_MODEL`과 `DEEPSEEK_COMPLEX_MODEL`로 모델을 지정할 수 있습니다.
+- `daily`는 최근 7일 후보를 확인해 유효한 기존 분석을 재사용합니다. `daily`와 `weekly`는 저장 또는 필수 전송에 실패한 경우 종료 코드 1을 반환합니다.
+- 로컬 회귀 검증은 `python -m unittest discover -s tests -v`로 실행합니다. 네트워크 호출은 테스트에서 대체합니다.
+
 ## 📋 시스템 개요
 
 YouTube 경쟁 채널 자동 분석 + 트렌드 모니터링 + 텔레그램 알림 시스템

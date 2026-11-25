@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS thumbnail_analysis (
 CREATE INDEX IF NOT EXISTS idx_video_snapshots_video_id ON video_snapshots(video_id);
 CREATE INDEX IF NOT EXISTS idx_video_snapshots_date ON video_snapshots(snapshot_date);
 CREATE INDEX IF NOT EXISTS idx_video_snapshots_source ON video_snapshots(source_type, snapshot_date);
+
+-- 기존 분석 이력은 NULL로 유지한다. 새 자동 실행 결과에만 고유 키를 사용한다.
+ALTER TABLE IF EXISTS public.daily_analysis ADD COLUMN IF NOT EXISTS processing_key TEXT UNIQUE;
+ALTER TABLE IF EXISTS public.weekly_reports ADD COLUMN IF NOT EXISTS processing_key TEXT UNIQUE;
+NOTIFY pgrst, 'reload schema';
 """
 
 conn = psycopg2.connect(DATABASE_URL)

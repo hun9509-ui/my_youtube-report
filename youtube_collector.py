@@ -2,9 +2,11 @@
 YouTube Data API를 이용해 영상 정보를 수집하는 모듈
 """
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from datetime import datetime, timedelta, timezone
 import re
 import config
+from gemini_client import safe_error
 
 
 # ===== 영상 길이 필터 =====
@@ -174,7 +176,7 @@ def is_shorts(video):
     return '#shorts' in title or '#shorts' in tags or duration_seconds <= 60
 
 
-def get_video_comments(video_id, max_comments=200):
+def get_video_comments(video_id, max_comments=200, *, raise_on_error=False):
     """영상의 상위 댓글 가져오기"""
     youtube = get_youtube_client()
     comments = []
@@ -186,6 +188,7 @@ def get_video_comments(video_id, max_comments=200):
                 videoId=video_id,
                 part='snippet',
                 order='relevance',
+                textFormat='plainText',
                 maxResults=min(100, max_comments - len(comments)),
                 pageToken=next_page_token
             ).execute()
@@ -201,9 +204,16 @@ def get_video_comments(video_id, max_comments=200):
             next_page_token = response.get('nextPageToken')
             if not next_page_token:
                 break
+    except HttpError as e:
+        if any(detail.get("reason") == "commentsDisabled" for detail in e.error_details or []):
+            return []
+        if raise_on_error:
+            raise
+        print(f"댓글 수집 실패 ({video_id}): {safe_error(e)}")
     except Exception as e:
-        # 댓글이 막혀있는 영상도 있음
-        print(f"댓글 수집 실패 ({video_id}): {e}")
+        if raise_on_error:
+            raise
+        print(f"댓글 수집 실패 ({video_id}): {safe_error(e)}")
     
     return comments
 

@@ -1,36 +1,12 @@
-"""
-Vertex AI를 이용한 영상 분석 모듈 (Gemini 3.1 Flash Lite)
-"""
-import vertexai
-from vertexai.generative_models import GenerativeModel
-import json
-import re
+"""Vertex AI를 이용한 영상, 썸네일, 트렌드 분석."""
+import base64
 import time
+
+import requests
+
 import config
-
-_initialized = False
-
-
-def _ensure_configured():
-    global _initialized
-    if not _initialized:
-        vertexai.init(
-            project=config.GOOGLE_CLOUD_PROJECT,
-            location=config.GOOGLE_CLOUD_LOCATION
-        )
-        _initialized = True
-
-
-def _extract_json(text: str) -> dict:
-    """응답에서 JSON 추출 (형식 무관 robust 처리)"""
-    text = text.strip()
-    block = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
-    if block:
-        text = block.group(1).strip()
-    obj = re.search(r'\{[\s\S]*\}', text)
-    if obj:
-        return json.loads(obj.group())
-    return json.loads(text)
+from analysis_schema import VideoAnalysis
+from gemini_client import generate_json, safe_error
 
 
 ANALYSIS_PROMPT = """
@@ -72,11 +48,7 @@ ANALYSIS_PROMPT = """
 
 def analyze_video(video_data, model_name=None, retry=3):
     """단일 영상 분석"""
-    _ensure_configured()
-    if model_name is None:
-        model_name = config.get_gemini_model('daily')
-    model = GenerativeModel(model_name)
-
+    model_name = model_name or config.get_gemini_model('daily')
     prompt = ANALYSIS_PROMPT.format(
         title=video_data.get('title', ''),
         channel=video_data.get('channel_title', ''),
@@ -88,34 +60,8 @@ def analyze_video(video_data, model_name=None, retry=3):
         duration=video_data.get('duration', '')
     )
 
-    for attempt in range(retry):
-        try:
-            response = model.generate_content(prompt)
-            result = _extract_json(response.text)
-            result['video_id'] = video_data.get('video_id', '')
-            return result
-
-        except json.JSONDecodeError as e:
-            raw = response.text[:300] if 'response' in dir() else ''
-            print(f"  ⚠️ JSON 파싱 실패 (시도 {attempt+1}): {e} | 응답: {raw}")
-            if attempt < retry - 1:
-                time.sleep(2)
-                continue
-            return {
-                'video_id': video_data.get('video_id', ''),
-                'error': f'JSON 파싱 실패: {e}',
-                'raw_response': raw
-            }
-        except Exception as e:
-            err = str(e)
-            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted", "resourceexhausted"]):
-                print(f"  ⚠️ Rate limit (시도 {attempt+1}), 60초 대기...")
-                time.sleep(60)
-                continue
-            print(f"  ❌ Gemini 오류: {err}")
-            return {'video_id': video_data.get('video_id', ''), 'error': err}
-
-    return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
+    result = generate_json(prompt, model_name, attempts=retry, response_model=VideoAnalysis)
+    return {**result, "video_id": video_data.get("video_id", "")}
 
 
 def analyze_videos_batch(videos, delay=5, model_mode='daily'):
@@ -175,9 +121,7 @@ JSON만 반환하세요.
 
 def analyze_own_video(video_data, retry=3):
     """자체 채널 영상 분석 (크리에이터 관점)"""
-    _ensure_configured()
     model_name = config.get_gemini_model('daily')
-    model = GenerativeModel(model_name)
 
     video_type = video_data.get('video_type', 'longform')
     prompt = OWN_CHANNEL_PROMPT.format(
@@ -189,25 +133,8 @@ def analyze_own_video(video_data, retry=3):
         views=video_data.get('view_count', 0),
     )
 
-    for attempt in range(retry):
-        try:
-            response = model.generate_content(prompt)
-            result = _extract_json(response.text)
-            result['video_id'] = video_data.get('video_id', '')
-            return result
-        except json.JSONDecodeError as e:
-            if attempt < retry - 1:
-                time.sleep(2)
-                continue
-            return {'video_id': video_data.get('video_id', ''), 'error': f'JSON 파싱 실패: {e}'}
-        except Exception as e:
-            err = str(e)
-            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted"]):
-                time.sleep(60)
-                continue
-            return {'video_id': video_data.get('video_id', ''), 'error': err}
-
-    return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
+    result = generate_json(prompt, model_name, attempts=retry, response_model=VideoAnalysis)
+    return {**result, "video_id": video_data.get("video_id", "")}
 
 
 THUMBNAIL_PROMPT = """
@@ -239,47 +166,30 @@ JSON만 반환하세요.
 
 def analyze_thumbnail(thumbnail_url: str, video_data: dict, retry: int = 3) -> dict:
     """썸네일 Vision 분석 (Gemini Pro)"""
-    import requests as _requests
-    from vertexai.generative_models import Part
-
-    _ensure_configured()
     model_name = config.get_gemini_model('vision')
-    model = GenerativeModel(model_name)
+    video_id = video_data.get("video_id", "")
 
     prompt = THUMBNAIL_PROMPT.format(
         channel=video_data.get('channel_title', ''),
         title=video_data.get('title', '')
     )
 
-    for attempt in range(retry):
-        try:
-            img_bytes = _requests.get(thumbnail_url, timeout=10).content
-            image_part = Part.from_data(img_bytes, mime_type='image/jpeg')
-            response = model.generate_content([image_part, prompt])
-            result = _extract_json(response.text)
-            result['video_id'] = video_data.get('video_id', '')
-            result['model_used'] = model_name
-            return result
-        except json.JSONDecodeError as e:
-            if attempt < retry - 1:
-                time.sleep(2)
-                continue
-            return {'video_id': video_data.get('video_id', ''), 'error': f'JSON 파싱 실패: {e}'}
-        except Exception as e:
-            err = str(e)
-            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted"]):
-                print(f"  ⚠️ Rate limit (시도 {attempt+1}), 60초 대기...")
-                time.sleep(60)
-                continue
-            return {'video_id': video_data.get('video_id', ''), 'error': err}
+    try:
+        response = requests.get(thumbnail_url, timeout=(5, 10))
+        response.raise_for_status()
+        mime_type = response.headers.get("Content-Type", "").split(";", 1)[0]
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise ValueError("썸네일 이미지 형식이 지원되지 않습니다")
+        image = {"mimeType": mime_type, "data": base64.b64encode(response.content).decode("ascii")}
+    except (requests.RequestException, ValueError) as exc:
+        return {"video_id": video_id, "error": safe_error(exc), "model_used": model_name}
 
-    return {'video_id': video_data.get('video_id', ''), 'error': 'Max retries exceeded'}
+    result = generate_json(prompt, model_name, attempts=retry, image=image, required_field="main_emotion")
+    return {**result, "video_id": video_id, "model_used": result.get("_model_version", model_name)}
 
 
 def detect_daily_trends(trending_videos):
     """일일 트렌드 영상에서 패턴 감지"""
-    _ensure_configured()
-    model = GenerativeModel(config.get_gemini_model('daily'))
 
     videos_summary = "\n".join([
         f"- [{v['view_count']:,}회] {v['title']} ({v['channel_title']})"
@@ -306,8 +216,4 @@ def detect_daily_trends(trending_videos):
 JSON만 반환하세요.
 """
 
-    try:
-        response = model.generate_content(prompt)
-        return _extract_json(response.text)
-    except Exception as e:
-        return {'error': str(e)}
+    return generate_json(prompt, config.get_gemini_model("daily"), required_field="summary")

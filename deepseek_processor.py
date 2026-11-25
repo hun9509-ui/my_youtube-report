@@ -6,87 +6,64 @@
 - 주간 리포트 / 시장 변화 분석 생성
 """
 import json
-import re
 import time
+
 import config
-
-_vertexai_initialized = False
-
-
-def _ensure_vertexai():
-    global _vertexai_initialized
-    if not _vertexai_initialized:
-        import vertexai
-        vertexai.init(project=config.GOOGLE_CLOUD_PROJECT, location=config.GOOGLE_CLOUD_LOCATION)
-        _vertexai_initialized = True
+from gemini_client import generate_json, RETRYABLE_STATUS_CODES, safe_error
 
 
 def _call_gemini_text(prompt: str, retry: int = 3) -> dict:
-    """Gemini 3.1 Pro로 텍스트 분석 (JSON 응답)"""
-    from vertexai.generative_models import GenerativeModel
-    _ensure_vertexai()
-    model = GenerativeModel(config.get_gemini_model('text'))
-
     full_prompt = "당신은 한국 유튜브 콘텐츠 분석 전문가입니다. 항상 JSON 형식으로만 응답하세요.\n\n" + prompt
-
-    for attempt in range(retry):
-        try:
-            response = model.generate_content(full_prompt)
-            text = response.text.strip()
-            block = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
-            if block:
-                text = block.group(1).strip()
-            obj = re.search(r'\{[\s\S]*\}', text)
-            return json.loads(obj.group() if obj else text)
-        except json.JSONDecodeError as e:
-            if attempt < retry - 1:
-                time.sleep(3)
-                continue
-            return {'error': f'JSON 파싱 실패: {e}'}
-        except Exception as e:
-            err = str(e)
-            if any(x in err.lower() for x in ["quota", "rate", "429", "resource_exhausted"]):
-                print(f"  ⚠️ Gemini rate limit (시도 {attempt+1}), 60초 대기...")
-                time.sleep(60)
-                continue
-            if attempt < retry - 1:
-                time.sleep(5)
-                continue
-            return {'error': err}
-    return {'error': 'Max retries exceeded'}
+    return generate_json(full_prompt, config.get_gemini_model("text"), attempts=retry)
 
 
 def _call_deepseek_api(prompt: str, complex_task: bool = False, retry: int = 3) -> dict:
-    """DeepSeek API 직접 호출"""
-    from openai import OpenAI
-    client = OpenAI(api_key=config.DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-    model = config.get_deepseek_model(complex_task=complex_task)
+    from openai import APIConnectionError, APIStatusError, OpenAI
 
-    for attempt in range(retry):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "당신은 한국 유튜브 콘텐츠 분석 전문가입니다. 항상 JSON 형식으로 응답하세요."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"}
-            )
-            return json.loads(response.choices[0].message.content)
-        except Exception as e:
-            if attempt < retry - 1:
-                time.sleep(5)
-                continue
-            return {'error': str(e)}
-    return {'error': 'Max retries exceeded'}
+    model = config.get_deepseek_model(complex_task=complex_task)
+    metadata = {"_provider": "deepseek", "_model": model}
+    if not config.DEEPSEEK_API_KEY:
+        return {"error": "DEEPSEEK_API_KEY 미설정", **metadata}
+
+    with OpenAI(api_key=config.DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                max_retries=0, timeout=90) as client:
+        for attempt in range(1, max(1, retry) + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "당신은 한국 유튜브 콘텐츠 분석 전문가입니다. 항상 JSON 형식으로 응답하세요."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
+                choice = response.choices[0]
+                if choice.finish_reason != "stop" or not choice.message.content:
+                    raise ValueError(f"DeepSeek 응답 종료 ({choice.finish_reason})")
+                result = json.loads(choice.message.content)
+                if not isinstance(result, dict) or "error" in result:
+                    raise ValueError("DeepSeek 응답은 분석 결과 JSON 객체여야 합니다")
+                return {**result, **metadata, "_model_version": response.model}
+            except APIStatusError as exc:
+                retryable = exc.status_code in RETRYABLE_STATUS_CODES
+                error = f"HTTP {exc.status_code}: {safe_error(exc)}"
+            except (APIConnectionError, ValueError, IndexError) as exc:
+                retryable = True
+                error = safe_error(exc)
+            print(f"  ⚠️ DeepSeek {model} ({attempt}/{max(1, retry)}): {error}")
+            if not retryable or attempt >= retry:
+                return {"error": error, **metadata}
+            time.sleep(min(2 ** attempt, 15))
 
 
 def call_deepseek(prompt, complex_task=False, retry=3):
     """텍스트 분석 진입점 — config.TEXT_ANALYSIS_ENGINE에 따라 Gemini 또는 DeepSeek 라우팅"""
-    if getattr(config, 'TEXT_ANALYSIS_ENGINE', 'deepseek') == 'gemini':
+    if config.TEXT_ANALYSIS_ENGINE == "gemini":
         return _call_gemini_text(prompt, retry=retry)
-    return _call_deepseek_api(prompt, complex_task=complex_task, retry=retry)
+    if config.TEXT_ANALYSIS_ENGINE == "deepseek":
+        return _call_deepseek_api(prompt, complex_task=complex_task, retry=retry)
+    return {"error": "TEXT_ANALYSIS_ENGINE은 gemini 또는 deepseek이어야 합니다"}
 
 
 def analyze_comments(video_title, comments):
@@ -338,7 +315,7 @@ def generate_market_intelligence(snapshot_summary: dict, emotion_summary: dict, 
 {snapshot_text[:1500]}
 
 [감정 온도 트렌드]
-{emotion_text[:1000]}
+{emotion_text[:1000] if emotion_summary else "관측된 댓글 분석 데이터 없음"}
 
 [TOP 영상]
 {top_text}
@@ -350,6 +327,8 @@ def generate_market_intelligence(snapshot_summary: dict, emotion_summary: dict, 
 {fast_text if fast_text else "없음"}
 
 중요: 셀럽 유튜브는 촬영~업로드 2~6주 차이가 있으므로, 단기 바이럴보다 "한달 뒤에도 살아남는 콘텐츠" 관점으로 분석하세요.
+댓글 분석 데이터가 없으면 dominant_emotion은 "unknown"으로 반환하세요.
+제공되지 않은 시청자 감정, 성장 패턴, 성과 원인은 관측 사실로 표현하지 마세요.
 
 다음 JSON으로 답변:
 {{

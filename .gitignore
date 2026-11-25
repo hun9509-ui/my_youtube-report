@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.env
+.env.*
+!.env.example
+*.log
+*.key
+*.pem
+gcp-key.json
+*service-account*.json

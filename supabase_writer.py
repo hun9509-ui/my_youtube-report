@@ -3,11 +3,24 @@ Supabase 이중 저장 모듈
 시트와 동일한 데이터를 PostgreSQL DB에도 저장
 """
 from supabase import create_client, Client
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 import config
+from gemini_client import has_text, safe_error
 
 
 _client: Client = None
+
+
+def _read_pages(query, page_size=500):
+    offset = 0
+    while True:
+        page = query.range(offset, offset + page_size - 1).execute().data
+        yield from page
+        if len(page) < page_size:
+            return
+        offset += len(page)
+
 
 def get_client() -> Client:
     """Supabase 클라이언트 (지연 초기화)"""
@@ -22,6 +35,8 @@ def get_client() -> Client:
 
 def save_videos(videos):
     """영상 마스터 저장 (중복 시 업데이트)"""
+    if not videos:
+        return 0
     client = get_client()
     if not client:
         return 0
@@ -45,10 +60,10 @@ def save_videos(videos):
     
     try:
         result = client.table('videos').upsert(rows).execute()
-        print(f"  💾 Supabase: videos {len(rows)}개 저장")
-        return len(rows)
+        print(f"  💾 Supabase: videos {len(result.data)}개 저장")
+        return len(result.data)
     except Exception as e:
-        print(f"  ⚠️ Supabase videos 저장 실패: {e}")
+        print(f"  ⚠️ Supabase videos 저장 실패: {safe_error(e)}")
         return 0
 
 
@@ -125,31 +140,57 @@ def save_initial_analysis(analyses, batch_num):
         })
 
     try:
-        client.table('initial_analysis').insert(rows).execute()
-        print(f"  💾 Supabase: initial_analysis {len(rows)}개 저장")
-        return len(rows)
+        result = client.table('initial_analysis').insert(rows).execute()
+        print(f"  💾 Supabase: initial_analysis {len(result.data)}개 저장")
+        return len(result.data)
     except Exception as e:
         print(f"  ⚠️ Supabase initial_analysis 저장 실패: {e}")
         return 0
 
 
-def save_daily_analysis(analyses):
+def get_daily_state(video_ids):
+    """영상별 최신 유효 분석 및 현재 버전 점수. 조회가 실패하면 예외를 전파한다."""
+    client = get_client()
+    if not client:
+        raise RuntimeError("Supabase 연결 설정 누락")
+    analyses, scored = {}, set()
+    for start in range(0, len(video_ids), 100):
+        batch = video_ids[start:start + 100]
+        query = (client.table("daily_analysis")
+                 .select("video_id,analysis_date,processing_key,gemini_raw,deepseek_raw")
+                 .in_("video_id", batch).order("id", desc=True))
+        for row in _read_pages(query):
+            if has_text(row.get("gemini_raw"), "topic"):
+                analyses.setdefault(row["video_id"], row)
+        scores = (client.table("video_scores").select("video_id")
+                  .eq("score_version", config.SCORE_VERSION)
+                  .in_("video_id", batch).execute().data)
+        scored.update(row["video_id"] for row in scores)
+    return analyses, scored
+
+
+def save_daily_analysis(analyses, analysis_date=None):
     """일일 분석 결과 저장"""
+    if not analyses:
+        return 0
     client = get_client()
     if not client:
         return 0
     
-    today = datetime.now().date().isoformat()
+    today = (analysis_date or datetime.now(config.KST).date()).isoformat()
     rows = []
     
     for a in analyses:
         gemini = a.get('gemini', {}) or {}
+        if not has_text(gemini, "topic"):
+            continue
         comments = a.get('comments', {}) or {}
         sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
         
         rows.append({
-            'analysis_date': today,
+            'analysis_date': a.get("analysis_date", today),
             'video_id': a.get('video_id', ''),
+            'processing_key': a['video_id'],
             'topic': gemini.get('topic', ''),
             'category': gemini.get('category', ''),
             'title_pattern': gemini.get('title_pattern', ''),
@@ -175,24 +216,30 @@ def save_daily_analysis(analyses):
             'ad_boost_score': comments.get('ad_boost_score', 0),
         })
 
+    if not rows:
+        return 0
     try:
-        result = client.table('daily_analysis').insert(rows).execute()
-        print(f"  💾 Supabase: daily_analysis {len(rows)}개 저장")
-        return len(rows)
+        result = client.table('daily_analysis').upsert(rows, on_conflict="processing_key").execute()
+        print(f"  💾 Supabase: daily_analysis {len(result.data)}개 저장")
+        return len(result.data)
     except Exception as e:
-        print(f"  ⚠️ Supabase daily_analysis 저장 실패: {e}")
+        print(f"  ⚠️ Supabase daily_analysis 저장 실패: {safe_error(e)}")
         return 0
 
 
-def save_weekly_report(report: dict) -> bool:
+def save_weekly_report(report: dict, report_date=None) -> bool:
     """주간 리포트 저장"""
+    if not has_text(report, "week_summary"):
+        return False
     client = get_client()
     if not client:
         return False
-    today = datetime.now().date().isoformat()
+    today = report_date or datetime.now(config.KST).date()
+    week_start = today - timedelta(days=today.weekday())
     try:
-        client.table('weekly_reports').insert({
-            'report_date': today,
+        result = client.table('weekly_reports').upsert({
+            'report_date': today.isoformat(),
+            'processing_key': week_start.isoformat(),
             'week_summary': report.get('week_summary', ''),
             'top_performing_channels': report.get('top_performing_channels', []),
             'rising_topics': report.get('rising_topics', []),
@@ -201,11 +248,13 @@ def save_weekly_report(report: dict) -> bool:
             'actionable_insights_for_hangoeun': report.get('actionable_insights_for_hangoeun', []),
             'next_video_suggestions': report.get('next_video_suggestions', []),
             'raw_data': report,
-        }).execute()
+        }, on_conflict="processing_key").execute()
+        if not result.data:
+            return False
         print(f"  💾 Supabase: weekly_reports 저장")
         return True
     except Exception as e:
-        print(f"  ⚠️ weekly_reports 저장 실패: {e}")
+        print(f"  ⚠️ weekly_reports 저장 실패: {safe_error(e)}")
         return False
 
 
@@ -546,11 +595,11 @@ def save_video_scores(scores: list) -> int:
         return 0
 
     try:
-        client.table('video_scores').upsert(
+        result = client.table('video_scores').upsert(
             rows, on_conflict='video_id,score_version'
         ).execute()
-        print(f"  💾 Supabase: video_scores {len(rows)}개 저장")
-        return len(rows)
+        print(f"  💾 Supabase: video_scores {len(result.data)}개 저장")
+        return len(result.data)
     except Exception as e:
         print(f"  ⚠️ video_scores 저장 실패: {e}")
         return 0
@@ -712,19 +761,20 @@ def get_all_tracked_video_ids() -> list:
         return []
 
 
-def get_recent_videos_from_db(days_back: int = 7) -> list:
+def get_recent_videos_from_db(days_back: int = 7, before=None) -> list:
     """최근 N일간 업로드된 경쟁채널 영상 조회 (갱신된 stats 포함)"""
     client = get_client()
     if not client:
         return []
-    cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
+    end = datetime.combine(before, datetime.min.time(), config.KST) if before else datetime.now(config.KST)
+    cutoff = end - timedelta(days=days_back)
     try:
-        result = client.table('videos')\
+        query = client.table('videos')\
             .select('video_id,channel_title,title,view_count,like_count,comment_count,published_at,video_url')\
-            .gte('published_at', cutoff)\
-            .order('view_count', desc=True)\
-            .execute()
-        return result.data
+            .gte('published_at', cutoff.isoformat())\
+            .lt('published_at', end.isoformat())\
+            .order('view_count', desc=True).order('video_id')
+        return list(_read_pages(query))
     except Exception as e:
         print(f"  ⚠️ 최근 영상 조회 실패: {e}")
         return []
@@ -881,14 +931,14 @@ def get_videos_for_thumbnail_analysis(mode: str = 'full_initial', limit: int = 5
 # weekly_market_state: 시장 변화 분석
 # ───────────────────────────────────────────────
 
-def save_weekly_market_state(state: dict) -> bool:
+def save_weekly_market_state(state: dict, report_date=None) -> bool:
     """주간 시장 분석 저장 (report_date upsert)"""
     client = get_client()
     if not client:
         return False
-    today = datetime.now().date().isoformat()
+    today = (report_date or datetime.now(config.KST).date()).isoformat()
     try:
-        client.table('weekly_market_state').upsert({
+        result = client.table('weekly_market_state').upsert({
             'report_date': today,
             'dominant_emotion': state.get('dominant_emotion', ''),
             'rising_topics': state.get('rising_topics', []),
@@ -903,14 +953,15 @@ def save_weekly_market_state(state: dict) -> bool:
             'market_summary': state.get('market_summary', ''),
             'raw_analysis': state,
         }, on_conflict='report_date').execute()
-        print(f"  💾 Supabase: weekly_market_state 저장 ({today})")
-        return True
+        if result.data:
+            print(f"  💾 Supabase: weekly_market_state 저장 ({today})")
+        return bool(result.data)
     except Exception as e:
         print(f"  ⚠️ weekly_market_state 저장 실패: {e}")
         return False
 
 
-def get_snapshot_growth_summary(days_back: int = 7) -> dict:
+def get_snapshot_growth_summary(days_back: int = 7, before=None) -> dict:
     """
     지난 N일 스냅샷에서 성장 패턴 집계.
     반환: {pattern: count, avg_growth_rate, top_growing: [...]}
@@ -918,20 +969,30 @@ def get_snapshot_growth_summary(days_back: int = 7) -> dict:
     client = get_client()
     if not client:
         return {}
-    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+    upper = before or datetime.now(config.KST).date() + timedelta(days=1)
+    cutoff = (upper - timedelta(days=days_back)).isoformat()
     try:
-        rows = client.table('video_snapshots')\
+        query = client.table('video_snapshots')\
             .select('video_id,channel_title,view_count,view_growth,view_growth_rate,growth_pattern,source_type')\
             .gte('snapshot_date', cutoff)\
-            .order('view_growth', desc=True)\
-            .execute().data
-
-        from collections import Counter
-        pattern_counter = Counter(r.get('growth_pattern') for r in rows if r.get('growth_pattern'))
+            .lt('snapshot_date', upper.isoformat())\
+            .order('view_growth', desc=True).order('id')
+        rows = list(_read_pages(query))
+        labeled_ids = sorted({row["video_id"] for row in rows if row.get("growth_pattern")})
+        valid_labels = set()
+        for batch in range(0, len(labeled_ids), 100):
+            ids = labeled_ids[batch:batch + 100]
+            observations = _growth_observations(client, ids, before=upper)
+            valid_labels.update(vid for vid, values in observations.items() if len(values) == 3)
+        for row in rows:
+            if row["video_id"] not in valid_labels:
+                row["growth_pattern"] = None
+        patterns = {r["video_id"]: r["growth_pattern"] for r in rows if r.get("growth_pattern")}
+        pattern_counter = Counter(patterns.values())
         avg_growth = sum(r.get('view_growth_rate', 0) or 0 for r in rows) / max(len(rows), 1)
 
         top_growing = sorted(
-            [r for r in rows if r.get('view_growth', 0) > 0],
+            [r for r in rows if (r.get('view_growth') or 0) > 0],
             key=lambda x: x.get('view_growth', 0), reverse=True
         )[:20]
 
@@ -946,7 +1007,7 @@ def get_snapshot_growth_summary(days_back: int = 7) -> dict:
         return {}
 
 
-def get_emotion_summary(days_back: int = 7) -> dict:
+def get_emotion_summary(days_back: int = 7, before=None) -> dict:
     """
     지난 N일 댓글 분석에서 감정 온도 집계.
     initial_analysis + daily_analysis의 deepseek_raw.emotion_temperature 평균
@@ -954,7 +1015,8 @@ def get_emotion_summary(days_back: int = 7) -> dict:
     client = get_client()
     if not client:
         return {}
-    cutoff = (datetime.now() - timedelta(days=days_back)).date().isoformat()
+    upper = before or datetime.now(config.KST).date() + timedelta(days=1)
+    cutoff = (upper - timedelta(days=days_back)).isoformat()
 
     emotions = ['comfort', 'healing', 'nostalgia', 'trust', 'intimacy',
                 'aspiration', 'envy', 'fatigue', 'cringe']
@@ -963,11 +1025,11 @@ def get_emotion_summary(days_back: int = 7) -> dict:
 
     try:
         for table in ['daily_analysis', 'initial_analysis']:
-            rows = client.table(table)\
+            query = client.table(table)\
                 .select('deepseek_raw')\
                 .gte('analysis_date', cutoff)\
-                .execute().data
-            for r in rows:
+                .lt('analysis_date', upper.isoformat()).order('id')
+            for r in _read_pages(query):
                 raw = r.get('deepseek_raw') or {}
                 et = raw.get('emotion_temperature') or {}
                 if et:
@@ -1176,9 +1238,23 @@ def get_channel_ad_boost_summary() -> list:
         return []
 
 
+def _growth_observations(client, video_ids=None, before=None):
+    query = (client.table("video_snapshots")
+             .select("video_id,view_count,days_since_publish")
+             .in_("days_since_publish", [1, 7, 30]).order("snapshot_date").order("id"))
+    if video_ids is not None:
+        query = query.in_("video_id", video_ids)
+    if before is not None:
+        query = query.lt("snapshot_date", before.isoformat())
+    observations = {}
+    for row in _read_pages(query):
+        observations.setdefault(row["video_id"], {})[row["days_since_publish"]] = row["view_count"]
+    return observations
+
+
 def update_growth_patterns(video_ids: list = None) -> int:
     """
-    video_snapshots에서 D1/D7/D30 스냅샷을 비교해 growth_pattern 업데이트.
+    D1, D7, D30에 실제로 수집한 스냅샷으로 성장 패턴을 갱신한다.
     video_ids=None이면 전체 대상.
     """
     client = get_client()
@@ -1188,36 +1264,17 @@ def update_growth_patterns(video_ids: list = None) -> int:
     import deepseek_processor as ds
 
     try:
-        # 스냅샷이 2개 이상인 video_id 목록
-        q = client.table('video_snapshots').select('video_id').execute()
-        all_ids = list({r['video_id'] for r in q.data})
-        if video_ids:
-            all_ids = [v for v in all_ids if v in video_ids]
-
+        if video_ids is None:
+            views_by_video = _growth_observations(client)
+        else:
+            views_by_video = {}
+            for start in range(0, len(video_ids), 100):
+                views_by_video.update(_growth_observations(client, video_ids[start:start + 100]))
         updated = 0
-        for vid in all_ids:
-            snaps = client.table('video_snapshots')\
-                .select('snapshot_date,view_count,days_since_publish')\
-                .eq('video_id', vid)\
-                .order('snapshot_date').execute().data
-
-            if len(snaps) < 2:
+        for vid, observations in views_by_video.items():
+            if len(observations) != 3:
                 continue
-
-            # days_since_publish 기준으로 D1/D7/D30 근사값 추출
-            def closest(target_days):
-                valid = [s for s in snaps if s.get('days_since_publish') is not None]
-                if not valid:
-                    return None
-                return min(valid, key=lambda s: abs((s.get('days_since_publish') or 0) - target_days))
-
-            d1 = closest(1)
-            d7 = closest(7)
-            d30 = closest(30)
-
-            d1_v = d1['view_count'] if d1 else 0
-            d7_v = d7['view_count'] if d7 else 0
-            d30_v = d30['view_count'] if d30 else 0
+            d1_v, d7_v, d30_v = (observations[day] or 0 for day in (1, 7, 30))
 
             pattern = ds.classify_growth_pattern(d1_v, d7_v, d30_v)
             if pattern == 'UNKNOWN':

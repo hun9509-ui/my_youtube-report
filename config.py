@@ -2,7 +2,9 @@
 한고은 채널 분석 시스템 - 설정 파일
 """
 import os
-from datetime import datetime
+from datetime import timedelta, timezone
+
+KST = timezone(timedelta(hours=9), name="KST")
 
 # ===== API 키 =====
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
@@ -19,7 +21,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ===== Google Cloud (Vertex AI) =====
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "totemic-courage-495009-h4")
-GOOGLE_CLOUD_LOCATION = "global"
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
 # ===== 분석 대상 채널 =====
 TARGET_CHANNELS = {
@@ -50,37 +52,32 @@ OWN_CHANNEL_ID = "UCPFW9tE-hAuyR4037csZAqg"
 OWN_CHANNEL_TRACKING_WEEKS = 5  # 업로드 후 5주 월요일까지 추적
 
 # ===== 분석 버전 =====
-ANALYSIS_VERSION = "1.1"  # 프롬프트/모델 기준 버전 (데이터 추적용)
+ANALYSIS_VERSION = "1.2"  # 검증된 응답 및 모델 버전 기록
 SCORE_VERSION = "v1.2"    # 전략 스코어링 버전
 
 # ===== 분석 설정 =====
 INITIAL_MONTHS = 6
 TOP_COMMENTS_COUNT = 200
 TRENDING_VIDEOS_COUNT = 50
+DAILY_LOOKBACK_DAYS = 7
 
 # ===== Gemini 모델 =====
 # TEXT_ANALYSIS_ENGINE: "gemini" | "deepseek"
 # "gemini"로 설정하면 deepseek_processor의 모든 분석이 Gemini로 라우팅됨
-TEXT_ANALYSIS_ENGINE = "gemini"
+TEXT_ANALYSIS_ENGINE = os.getenv("TEXT_ANALYSIS_ENGINE", "gemini").strip().lower()
 
 def get_gemini_model(mode='daily'):
-    """mode: 'initial' | 'daily' | 'free' | 'vision' | 'text'"""
-    if mode == 'free':
-        return "gemini-2.0-flash-001"
-    if mode in ('vision', 'text'):
-        return "gemini-3.1-pro-preview"
-    return "gemini-2.5-flash"
+    """용도별 모델을 개별 환경변수로 변경할 수 있다."""
+    default = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    return os.getenv(f"GEMINI_{mode.upper()}_MODEL", default)
 
 # ===== 대박 영상 기준 =====
 HIT_VIDEO_MULTIPLIER = 2.0  # 채널 평균 조회수 × 2배 이상
 
 # ===== DeepSeek 모델 =====
-DEEPSEEK_DISCOUNT_END = datetime(2026, 5, 31, 23, 59)
-
 def get_deepseek_model(complex_task=False):
-    if complex_task and datetime.now() < DEEPSEEK_DISCOUNT_END:
-        return "deepseek-v4-pro"
-    return "deepseek-v4-flash"
+    default = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    return os.getenv("DEEPSEEK_COMPLEX_MODEL", default) if complex_task else default
 
 # ===== 구글 시트 탭 이름 =====
 SHEET_VIDEOS = "영상_마스터데이터"
