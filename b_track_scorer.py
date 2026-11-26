@@ -10,6 +10,7 @@ B-track 엔티티 판단 레이어.
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from statistics import median
@@ -25,6 +26,74 @@ WINDOW_7D = 7
 WINDOW_30D = 30
 WINDOW_90D = 90
 KST = timezone(timedelta(hours=9))
+
+FORMAT_KEYWORDS = {
+    "lookbook": ("룩북", "ootd", "착장", "데일리룩", "출근룩", "데이트룩"),
+    "styling": ("코디", "스타일링", "매치", "입는 법", "레이어드"),
+    "haul": ("하울", "언박싱", "쇼핑", "지름", "내돈내산", "택배"),
+    "buying_guide": (
+        "추천", "가이드", "고르는 법", "비교", "베스트", "top", "올영", "무신사",
+        "다이소", "쿠팡", "가성비", "꿀템", "찐템", "사기 전",
+    ),
+    "review": ("리뷰", "후기", "착용", "솔직", "장단점"),
+    "routine": ("루틴", "grwm", "겟레디", "스킨케어", "메이크업"),
+}
+FORMAT_DIFFICULTY = {
+    "shorts_tip": 0.25, "buying_guide": 0.40, "review": 0.45, "routine": 0.50,
+    "styling": 0.60, "haul": 0.65, "lookbook": 0.75, "vlog": 0.55,
+}
+COMMERCE_KEYWORDS = (
+    "구매", "추천", "하울", "언박싱", "쇼핑", "가성비", "가격", "할인", "세일", "올영",
+    "무신사", "쿠팡", "다이소", "링크", "품절", "재구매", "내돈내산", "찐템", "꿀템", "신상",
+)
+SHOPPING_INTENT_KEYWORDS = (
+    "사기 전", "비교", "고르는 법", "추천템", "가성비", "사이즈", "착샷", "후기", "리뷰",
+    "내돈내산", "재구매", "추천", "꿀템",
+)
+LUXURY_KEYWORDS = ("럭셔리", "명품", "샤넬", "에르메스", "디올", "luxury", "chanel", "hermes", "dior")
+COMMERCE_TYPE_BONUS = {"item": 0.25, "product": 0.25, "brand": 0.20, "style": 0.10, "trend": 0.10}
+
+ENTITY_SYNONYM_MAP = {
+    alias: names[0]
+    for names in (
+        ("나이키", "nike"),
+        ("아디다스", "adidas"),
+        ("뉴발란스", "newbalance"),
+        ("아식스", "asics"),
+        ("살로몬", "salomon"),
+        ("유니클로", "uniqlo"),
+        ("자라", "zara"),
+        ("코스", "cos"),
+        ("무신사", "musinsa"),
+        ("올리브영", "올영", "oliveyoung"),
+        ("다이소", "daiso"),
+        ("쿠팡", "coupang"),
+        ("샤넬", "chanel"),
+        ("에르메스", "hermes"),
+        ("디올", "dior"),
+        ("프라다", "prada"),
+        ("미우미우", "miumiu"),
+        ("룰루레몬", "lululemon"),
+        ("파타고니아", "patagonia"),
+        ("아크테릭스", "arcteryx"),
+        ("스투시", "stussy"),
+        ("폴로", "랄프로렌", "polo", "ralphlauren"),
+        ("노스페이스", "northface"),
+        ("컨버스", "converse"),
+        ("반스", "vans"),
+        ("자크뮈스", "jacquemus"),
+        ("발렌시아가", "balenciaga"),
+        ("셀린느", "celine"),
+        ("보테가베네타", "bottegaveneta"),
+        ("에이치앤엠", "hm"),
+    )
+    for alias in names
+}
+
+
+def canonical_entity_key(name: str) -> str:
+    normalized = re.sub(r"[\s\-_.&']+", "", str(name or "").strip().lower())
+    return ENTITY_SYNONYM_MAP.get(normalized, normalized)
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -49,6 +118,10 @@ def _days_ago(value: Any, now: datetime) -> int | None:
 
 def _round(value: float, digits: int = 3) -> float:
     return round(float(value or 0), digits)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(value, 1.0))
 
 
 def _confidence(mention_count_30d: int, distinct_channels_30d: int) -> str:
@@ -87,12 +160,98 @@ def _recommended_action(stage: str, avg_baseline: float, confidence: str) -> str
     return "관찰"
 
 
+def _mention_text(mention: dict) -> str:
+    return f"{mention.get('title') or ''} {mention.get('description_short') or ''}".lower()
+
+
+def classify_format(mention: dict) -> str:
+    for fmt in (mention.get("content_format"), mention.get("format")):
+        if isinstance(fmt, str) and fmt in FORMAT_DIFFICULTY:
+            return fmt
+
+    text = _mention_text(mention)
+    for fmt, keywords in FORMAT_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return fmt
+    return "shorts_tip" if str(mention.get("video_type") or "").lower() == "shorts" else "vlog"
+
+
 def _format_distribution(mentions_30d: list[dict]) -> dict[str, int]:
-    formats = []
+    return dict(Counter(classify_format(mention) for mention in mentions_30d).most_common())
+
+
+def _fashion_scores(
+    entity: dict,
+    mentions_30d: list[dict],
+    *,
+    fmt_dist: dict[str, int],
+    best_format: str,
+    avg_baseline: float,
+    hit_ratio: float,
+    distinct_channels_30d: int,
+    stage: str,
+    freshness: float,
+) -> dict[str, float]:
+    engagement_rates = []
+    comment_rates = []
+    texts = [_mention_text(mention) for mention in mentions_30d]
     for mention in mentions_30d:
-        fmt = mention.get("content_format") or mention.get("format") or "unknown"
-        formats.append(str(fmt))
-    return dict(Counter(formats).most_common())
+        views = int(mention.get("view_count_at_scan") or mention.get("view_count") or 0)
+        likes = int(mention.get("like_count") or 0)
+        comments = int(mention.get("comment_count") or 0)
+        if views > 0 and (likes > 0 or comments > 0):
+            engagement_rates.append((likes + comments * 3) / views)
+        if views > 0 and comments > 0:
+            comment_rates.append(comments / views)
+
+    def keyword_share(keywords: tuple[str, ...]) -> float:
+        if not texts:
+            return 0.0
+        return sum(any(keyword in text for keyword in keywords) for text in texts) / len(texts)
+
+    entity_type = entity.get("entity_type")
+    commerce_bonus = COMMERCE_TYPE_BONUS.get(entity_type, 0.05)
+    commerce_signal = _clamp01(keyword_share(COMMERCE_KEYWORDS) * 0.75 + commerce_bonus)
+    product_or_brand = entity_type in ("item", "product", "brand")
+    channel_reach = min(distinct_channels_30d / 8.0, 1.0)
+    heat_base = min(avg_baseline / 3.0, 1.0) * 0.45 + hit_ratio * 0.30 + channel_reach * 0.25
+    ppl_stage_bonus = 0.10 if stage in ("rising", "breakout", "mainstream") else 0.0
+    ppl_fatigue_penalty = 0.25 if stage == "fatigue" else 0.0
+
+    category = str(entity.get("category") or "").lower()
+    if any(keyword in category for keyword in ("fashion", "accessory", "brand", "shopping", "active", "style")):
+        category_fit = 0.45
+    elif any(keyword in category for keyword in ("beauty", "fragrance", "lifestyle")):
+        category_fit = 0.38
+    else:
+        category_fit = 0.20
+    if best_format in ("lookbook", "styling", "haul", "buying_guide", "review"):
+        format_fit = 0.30
+    elif best_format in ("routine", "shorts_tip"):
+        format_fit = 0.22
+    else:
+        format_fit = 0.15
+
+    entity_name = str(entity.get("name") or entity.get("entity_name") or "").lower()
+    luxury = any(keyword in entity_name for keyword in LUXURY_KEYWORDS) or keyword_share(LUXURY_KEYWORDS) > 0.5
+    saturation = min(distinct_channels_30d / 10, 1.0)
+    median_comment_rate = median(comment_rates) if comment_rates else 0.0
+    scores = {
+        "engagement_score": median(engagement_rates) / 0.06 if engagement_rates else 0.0,
+        "commerce_signal": commerce_signal,
+        "item_heat_score": heat_base * (1.0 if product_or_brand else 0.85),
+        "shopping_intent_score": (
+            keyword_share(SHOPPING_INTENT_KEYWORDS) * 0.75 + min(median_comment_rate / 0.005, 1.0) * 0.25
+        ),
+        "ppl_potential": (
+            (0.35 if product_or_brand else 0.15) + commerce_signal * 0.35 + channel_reach * 0.20
+            + ppl_stage_bonus - ppl_fatigue_penalty
+        ),
+        "channel_fit_score": category_fit + format_fit + min(avg_baseline / 2.5, 1.0) * 0.25,
+        "production_difficulty": FORMAT_DIFFICULTY.get(best_format, 0.55) + (0.15 if luxury else 0.0),
+        "originality_room": (1.0 - saturation) * 0.50 + freshness * 0.30 + (0.20 if len(fmt_dist) <= 2 else 0.10),
+    }
+    return {key: _round(_clamp01(value)) if mentions_30d else 0.0 for key, value in scores.items()}
 
 
 def _best_examples(mentions_30d: list[dict], limit: int = 3) -> list[dict]:
@@ -183,6 +342,7 @@ def score_entity(
     best_format = next(iter(fmt_dist.keys()), "unknown")
     examples = _best_examples(mentions_30d)
     total_views_30d = sum(int(m.get("view_count_at_scan") or m.get("view_count") or 0) for m in mentions_30d)
+    freshness = 1.0 if stage in ("seed", "rising", "breakout") else 0.4
 
     entity_name = entity.get("name") or entity.get("entity_name") or ""
     score = {
@@ -205,7 +365,6 @@ def score_entity(
         "underperform_count": underperform_count,
         "hit_ratio": _round(hit_ratio),
         "total_views_30d": total_views_30d,
-        "engagement_score": 0,
         "velocity_7d": _round(velocity_7d),
         "velocity_30d": _round(velocity_30d),
         "acceleration_score": _round(acceleration),
@@ -213,19 +372,16 @@ def score_entity(
         "stage_reason": stage_reason,
         "peak_risk": _round(1 - hit_ratio if stage in ("mainstream", "fatigue") else 0),
         "saturation_score": _round(min(distinct_channels_30d / 10, 1.0)),
-        "freshness_score": _round(1.0 if stage in ("seed", "rising", "breakout") else 0.4),
+        "freshness_score": _round(freshness),
         "best_format": best_format,
         "format_distribution": fmt_dist,
         "best_examples": examples,
-        "commerce_signal": 0,
         "brand_heat_score": _round(min((avg_baseline / 3) + (distinct_channels_30d / 10), 1.0)),
-        "item_heat_score": 0,
-        "shopping_intent_score": 0,
-        "ppl_potential": 0,
-        "channel_fit_score": 0,
         "timing_score": _round(min((velocity_7d * 2) + hit_ratio, 1.0)),
-        "production_difficulty": 0,
-        "originality_room": 0,
+        **_fashion_scores(
+            entity, mentions_30d, fmt_dist=fmt_dist, best_format=best_format, avg_baseline=avg_baseline,
+            hit_ratio=hit_ratio, distinct_channels_30d=distinct_channels_30d, stage=stage, freshness=freshness,
+        ),
         "recommended_action": action,
         "suggested_angle": _suggest_angle(entity_name, best_format, stage),
         "confidence": confidence,
@@ -271,6 +427,7 @@ def _evidence_bullets(score: dict) -> list[str]:
         f"최근 30일 {score['mention_count_30d']}회 언급, {score['distinct_channels_30d']}개 채널에서 감지",
         f"평균 view_over_baseline {score['avg_view_over_baseline']:.2f}배, 최고 {score['best_view_over_baseline']:.2f}배",
         f"트렌드 단계: {score['trend_stage']} ({score['stage_reason']})",
+        f"주력 포맷 {score['best_format']} | 커머스 신호 {score['commerce_signal']:.2f} | 참여율 {score['engagement_score']:.2f}",
     ]
 
 
@@ -338,7 +495,8 @@ def _load_mentions_for_entities(db, entity_ids: list[int]) -> dict[int, list[dic
         batch = video_ids[i:i + 100]
         for video in _read_pages(
             lambda: db.table("trend_videos").select(
-                "video_id,title,channel_title,view_count,view_over_baseline,video_type"
+                "video_id,title,channel_title,view_count,like_count,comment_count,duration_seconds,"
+                "description_short,view_over_baseline,video_type"
             ).in_("video_id", batch).order("video_id")
         ):
             videos[video["video_id"]] = video
@@ -349,12 +507,40 @@ def _load_mentions_for_entities(db, entity_ids: list[int]) -> dict[int, list[dic
         merged["title"] = video.get("title", merged.get("title", ""))
         merged["channel_title"] = video.get("channel_title", merged.get("channel_title", ""))
         merged["view_over_baseline"] = video.get("view_over_baseline", merged.get("view_over_baseline", 0))
-        merged["content_format"] = merged.get("content_format") or video.get("video_type") or "unknown"
+        merged["video_type"] = video.get("video_type") or merged.get("video_type") or ""
         merged["view_count"] = video.get("view_count", merged.get("view_count_at_scan", 0))
+        merged["like_count"] = video.get("like_count") or 0
+        merged["comment_count"] = video.get("comment_count") or 0
+        merged["duration_seconds"] = video.get("duration_seconds") or 0
+        merged["description_short"] = video.get("description_short") or ""
         eid = row.get("entity_id")
         if eid in mentions_by_entity:
             mentions_by_entity[eid].append(merged)
     return mentions_by_entity
+
+
+def _mention_rank(mention: dict) -> tuple[float, int]:
+    return float(mention.get("confidence") or 0), int(mention.get("view_count_at_scan") or 0)
+
+
+def _merge_mentions(group: list[dict], mentions_by_entity: dict[int, list[dict]]) -> list[dict]:
+    if len(group) == 1:
+        return mentions_by_entity.get(group[0]["id"], [])
+
+    merged = []
+    video_indices = {}
+    for entity in group:
+        for mention in mentions_by_entity.get(entity["id"], []):
+            video_id = mention.get("video_id")
+            if video_id and video_id in video_indices:
+                idx = video_indices[video_id]
+                if _mention_rank(mention) > _mention_rank(merged[idx]):
+                    merged[idx] = mention
+                continue
+            if video_id:
+                video_indices[video_id] = len(merged)
+            merged.append(mention)
+    return merged
 
 
 def run_score(max_entities: int = 500) -> int:
@@ -372,13 +558,23 @@ def run_score(max_entities: int = 500) -> int:
 
     entity_ids = [e["id"] for e in entities]
     mentions_by_entity = _load_mentions_for_entities(db, entity_ids)
+    groups = {}
+    for entity in entities:
+        key = canonical_entity_key(entity.get("name", ""))
+        groups.setdefault(key or (entity["id"],), []).append(entity)
+
     scores = []
     cards = []
     now = datetime.now(timezone.utc)
     scored_at = now.astimezone(KST).date()
 
-    for entity in entities:
-        mentions = mentions_by_entity.get(entity["id"], [])
+    for group in groups.values():
+        entity = min(group, key=lambda e: (
+            -len(mentions_by_entity.get(e["id"], [])),
+            not re.search(r"[가-힣ㄱ-ㅎㅏ-ㅣ]", e.get("name") or ""),
+            e["id"],
+        ))
+        mentions = _merge_mentions(group, mentions_by_entity)
         if not mentions:
             continue
         score, card = score_entity(entity, mentions, scored_at=scored_at, now=now)
