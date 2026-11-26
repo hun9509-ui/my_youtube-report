@@ -161,7 +161,9 @@ class LeadLagTest(unittest.TestCase):
 
 class HitDriversTest(unittest.TestCase):
     def test_normalization_lift_comments_and_score_provenance(self):
-        result = learner.analyze_hit_drivers_and_calibrate_scorer(*hit_fixture(), [], min_samples=2)
+        result = learner.analyze_hit_drivers_and_calibrate_scorer(
+            *hit_fixture(), [], min_samples=2, score_version="v1.2",
+        )
         self.assertEqual(result["channel_medians"], {"셀럽": 30, "다른 채널": 10000})
         self.assertEqual(result["view_over_channel_median"]["other"], 1)
         self.assertAlmostEqual(result["baseline_hit_rate"], 2 / 6)
@@ -198,10 +200,30 @@ class HitDriversTest(unittest.TestCase):
         for score in scores:
             if "execution_score" in score:
                 score["execution_score"] = 100 - score["execution_score"]
-        report = learner.analyze_hit_drivers_and_calibrate_scorer(videos, analyses, thumbs, scores, [])
+        report = learner.analyze_hit_drivers_and_calibrate_scorer(
+            videos, analyses, thumbs, scores, [], score_version="v1.2",
+        )
         recommendation = report["scorer_backtest"]["weight_recommendations"]["execution_score"]
         self.assertEqual(recommendation["spearman_r"], -1)
         self.assertIn("축소", recommendation["recommendation"])
+
+    def test_v2_backtest_selects_score_rows_and_includes_upload_delay(self):
+        videos, analyses, thumbs, scores = hit_fixture()
+        scores += [
+            {"video_id": "v0", "score_version": "v2.0", "priority_score": 10, "upload_delay_risk": 80},
+            {"video_id": "v4", "score_version": "v2.0", "priority_score": 90, "upload_delay_risk": 5},
+        ]
+        result = learner.analyze_hit_drivers_and_calibrate_scorer(
+            videos, analyses, thumbs, scores, [], score_version="v2.0",
+        )
+        backtest = result["scorer_backtest"]
+        self.assertEqual(backtest["score_version"], "v2.0")
+        self.assertEqual(backtest["eligible_scored_video_count"], 2)
+        self.assertEqual(backtest["correlations"]["upload_delay_risk"]["n"], 2)
+        weights = backtest["weight_recommendations"]
+        self.assertEqual(weights["novelty_score"]["current_weight"], 0.34)
+        self.assertEqual(weights["risk_score"]["current_weight"], -0.14)
+        self.assertEqual(weights["upload_delay_risk"]["current_weight"], -0.04)
 
 
 class OwnTrajectoryTest(unittest.TestCase):
@@ -289,28 +311,7 @@ class ReportTest(unittest.TestCase):
         self.assertIn("일일 분석", report["caveats"][2])
 
     def test_playbook_threshold_and_six_sections_through_cli(self):
-        videos, analyses, thumbs, scores = hit_fixture()
-        dataset = {
-            "videos": videos,
-            **{table: [row for row in analyses if row["source_table"] == table]
-               for table in ("initial_analysis", "daily_analysis")},
-            "thumbnail_analysis": thumbs, "video_scores": scores, "video_snapshots": [],
-            "own_channel_videos": [], "own_channel_analysis": [], "own_channel_snapshots": [],
-            "own_channel_hourly_snapshots": [],
-        }
-        with TemporaryDirectory() as directory, patch.object(
-            learner, "load_dataset_from_supabase", return_value=dataset,
-        ) as load:
-            markdown = Path(directory) / "nested" / "report.md"
-            structured = Path(directory) / "report.json"
-            self.assertEqual(learner.main([
-                "--out", str(markdown), "--json-out", str(structured),
-                "--min-samples", "2", "--lookback-days", "60", "--skip-btrack",
-            ]), 0)
-            report = json.loads(structured.read_text(encoding="utf-8"))
-            rendered = markdown.read_text(encoding="utf-8")
-        self.assertEqual(load.call_args.kwargs["lookback_days"], 60)
-        self.assertTrue(load.call_args.kwargs["skip_btrack"])
+        report, rendered = self._run_cli_with_scores("v1.2")
         self.assertEqual(report["lookback_days"], 60)
         self.assertIn("라이프", rendered)
         self.assertIn("Precision@Top20%", rendered)
@@ -327,6 +328,48 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(at_five["combinations"])
         self.assertFalse(at_five["emotion_temperature"])
         self.assertFalse(at_five["scorer_weights"])
+
+    def test_v2_backtest_through_cli_override_and_config_default(self):
+        for configured_version, cli_version in (("v1.2", "v2.0"), ("v2.0", None)):
+            with self.subTest(configured_version=configured_version, cli_version=cli_version), patch.object(
+                learner.config, "SCORE_VERSION", configured_version,
+            ):
+                report, rendered = self._run_cli_with_scores(cli_version)
+                backtest = report["hit_drivers"]["scorer_backtest"]
+                self.assertEqual(backtest["score_version"], "v2.0")
+                self.assertEqual(backtest["eligible_scored_video_count"], 1)
+                self.assertIn("## 4. strategy_scorer v2.0 백테스트", rendered)
+                weights = backtest["weight_recommendations"]
+                self.assertEqual(weights["novelty_score"]["current_weight"], 0.34)
+                self.assertEqual(weights["risk_score"]["current_weight"], -0.14)
+
+    def _run_cli_with_scores(self, version):
+        videos, analyses, thumbs, scores = hit_fixture()
+        scores.append({"video_id": "v4", "score_version": "v2.0", "priority_score": 95})
+        dataset = {
+            "videos": videos,
+            **{table: [row for row in analyses if row["source_table"] == table]
+               for table in ("initial_analysis", "daily_analysis")},
+            "thumbnail_analysis": thumbs, "video_scores": scores, "video_snapshots": [],
+            "own_channel_videos": [], "own_channel_analysis": [], "own_channel_snapshots": [],
+            "own_channel_hourly_snapshots": [],
+        }
+        with TemporaryDirectory() as directory, patch.object(
+            learner, "load_dataset_from_supabase", return_value=dataset,
+        ) as load:
+            markdown = Path(directory) / "nested" / "report.md"
+            structured = Path(directory) / "report.json"
+            score_args = ["--score-version", version] if version else []
+            self.assertEqual(learner.main([
+                "--out", str(markdown), "--json-out", str(structured),
+                "--min-samples", "2", "--lookback-days", "60", "--skip-btrack",
+                *score_args,
+            ]), 0)
+            report = json.loads(structured.read_text(encoding="utf-8"))
+            rendered = markdown.read_text(encoding="utf-8")
+        self.assertEqual(load.call_args.kwargs["lookback_days"], 60)
+        self.assertTrue(load.call_args.kwargs["skip_btrack"])
+        return report, rendered
 
 
 class SupabaseReadOnlyTest(unittest.TestCase):
@@ -367,6 +410,8 @@ class SupabaseReadOnlyTest(unittest.TestCase):
                     self.assertNotIn("*", pages[0]["select"])
                     if table == "video_snapshots":
                         self.assertTrue(all(page["days_since_publish"] == "in.(1,7,30)" for page in pages))
+                    if table == "video_scores":
+                        self.assertIn("upload_delay_risk", pages[0]["select"].split(","))
                     if table in {"entity_mentions", "trend_videos"}:
                         self.assertTrue(all(page["published_at"] == "gte." + days_ago(210) for page in pages))
                         self.assertLessEqual(len(pages[0]["select"].split(",")), 5)

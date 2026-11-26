@@ -12,6 +12,7 @@ import unicodedata
 
 import config
 from gemini_client import has_text, safe_error
+from strategy_scorer import PRIORITY_WEIGHTS
 import supabase_writer
 
 
@@ -19,18 +20,22 @@ _ANALYSIS_COLUMNS = (
     "id,video_id,analysis_date,topic,category,title_pattern,title_keywords,"
     "ppl_likely,applicability,gemini_raw,deepseek_raw,ad_boost_suspected"
 )
-_SCORE_VERSION = "v1.2"
-# Signed coefficients of the v1.2 priority formula in strategy_scorer.py.
-_SCORE_WEIGHTS = {
-    "hangoeun_fit_score": 0.30,
-    "execution_score": 0.07,
-    "repeatability_score": 0.18,
-    "novelty_score": 0.12,
-    "risk_score": -0.15,
-    "ppl_potential_score": 0.10,
-    "trend_lifespan_score": 0.08,
-    "evergreen_score": 0.15,
+_SCORE_WEIGHTS_BY_VERSION = {
+    "v1.2": {
+        "hangoeun_fit_score": 0.30,
+        "execution_score": 0.07,
+        "repeatability_score": 0.18,
+        "novelty_score": 0.12,
+        "risk_score": -0.15,
+        "ppl_potential_score": 0.10,
+        "trend_lifespan_score": 0.08,
+        "evergreen_score": 0.15,
+    },
+    "v2.0": PRIORITY_WEIGHTS,
 }
+_SCORE_FIELDS = tuple(dict.fromkeys(
+    field for weights in _SCORE_WEIGHTS_BY_VERSION.values() for field in weights
+))
 _ACTIONS = ("바로 기획화", "각색 후 기획", "아이디어 보관", "우선순위 낮음")
 _EMOTIONS = ("comfort", "healing", "nostalgia", "trust", "intimacy",
              "aspiration", "envy", "fatigue", "cringe")
@@ -160,7 +165,7 @@ def load_dataset_from_supabase(
         "video_scores": read(
             "video_scores",
             "video_id,score_version,source_table,priority_score,recommended_action,"
-            + ",".join(_SCORE_WEIGHTS),
+            + ",".join(_SCORE_FIELDS),
             "video_id", "score_version",
         ),
         "video_snapshots": read(
@@ -632,8 +637,11 @@ def _weight_recommendation(weight, correlation):
 
 def _scorer_backtest(
     video_scores, comp_analyses, analyses, ratios, baseline, hit_multiplier,
+    score_version: str | None = None,
 ):
-    candidates = [row for row in video_scores if row.get("score_version") in (None, "", _SCORE_VERSION)]
+    resolved_version = score_version or getattr(config, "SCORE_VERSION", "v1.2")
+    weights = _SCORE_WEIGHTS_BY_VERSION.get(resolved_version, _SCORE_WEIGHTS_BY_VERSION["v2.0"])
+    candidates = [row for row in video_scores if row.get("score_version") in (None, "", resolved_version)]
     contaminated = _contaminated_daily_scores(candidates, comp_analyses)
     valid_initial = {
         row["video_id"] for row in comp_analyses
@@ -653,11 +661,11 @@ def _scorer_backtest(
         if row.get("source_table") == "initial_analysis" and video_id not in valid_initial:
             excluded_initial += 1
             continue
-        if video_id in ratios and (video_id not in scored or row.get("score_version") == _SCORE_VERSION):
+        if video_id in ratios and (video_id not in scored or row.get("score_version") == resolved_version):
             scored[video_id] = row
 
     correlations = {}
-    for field in ("priority_score", *_SCORE_WEIGHTS):
+    for field in ("priority_score", *weights):
         pairs = []
         for video_id, row in scored.items():
             value = _number(row.get(field))
@@ -675,7 +683,7 @@ def _scorer_backtest(
     for video_id, row in scored.items():
         actions[row.get("recommended_action")].append(ratios[video_id])
     return {
-        "score_version": _SCORE_VERSION, "eligible_scored_video_count": len(scored),
+        "score_version": resolved_version, "eligible_scored_video_count": len(scored),
         "excluded_contaminated_daily_score_count": len(contaminated),
         "excluded_invalid_initial_score_count": excluded_initial,
         "excluded_without_valid_analysis_count": excluded_without_analysis,
@@ -689,14 +697,14 @@ def _scorer_backtest(
         },
         "weight_recommendations": {
             field: _weight_recommendation(weight, correlations[field])
-            for field, weight in _SCORE_WEIGHTS.items()
+            for field, weight in weights.items()
         },
     }
 
 
 def analyze_hit_drivers_and_calibrate_scorer(
     comp_videos, comp_analyses, thumbnail_analyses, video_scores, video_snapshots,
-    *, hit_multiplier=2.0, min_samples=5,
+    *, hit_multiplier=2.0, min_samples=5, score_version: str | None = None,
 ) -> dict:
     """Measure cohort lift and rank correlations against channel view medians."""
     if min_samples < 1 or not math.isfinite(hit_multiplier) or hit_multiplier <= 0:
@@ -776,6 +784,7 @@ def analyze_hit_drivers_and_calibrate_scorer(
         }),
         "scorer_backtest": _scorer_backtest(
             video_scores, comp_analyses, analyses, ratios, baseline_rate, hit_multiplier,
+            score_version=score_version,
         ),
     }
 
@@ -1183,8 +1192,9 @@ def render_markdown_report(report) -> str:
         for key, row in {"ad_boost_suspected": drivers["ad_boost_correlation"],
                          **drivers["emotion_temperature_correlations"]}.items()
     ))
-    lines.extend(("## 4. strategy_scorer v1.2 백테스트 및 가중치 보정 제안", ""))
-    _render_backtest(lines, drivers["scorer_backtest"])
+    backtest = drivers["scorer_backtest"]
+    lines.extend((f"## 4. strategy_scorer {backtest['score_version']} 백테스트 및 가중치 보정 제안", ""))
+    _render_backtest(lines, backtest)
     lines.extend(("## 5. 자체 채널(고은언니 한고은) 조기 궤적 모델", ""))
     _render_own_channel(lines, report["own_channel_trajectory"])
     lines.extend((f"## 6. 검증된 학습 플레이북 (n ≥ {playbook['min_samples']})", ""))
@@ -1194,7 +1204,7 @@ def render_markdown_report(report) -> str:
 
 def run_pattern_report(
     *, client=None, lookback_days=210, min_samples=7, skip_btrack=False, now=None,
-    out=None, json_out=None,
+    out=None, json_out=None, score_version: str | None = None,
 ) -> dict:
     """Load and analyze the database, optionally writing local report files."""
     if min_samples < 1:
@@ -1215,7 +1225,7 @@ def run_pattern_report(
         "btrack_lead_lag": btrack,
         "hit_drivers": analyze_hit_drivers_and_calibrate_scorer(
             videos, analyses, dataset["thumbnail_analysis"], dataset["video_scores"],
-            dataset["video_snapshots"], min_samples=min_samples,
+            dataset["video_snapshots"], min_samples=min_samples, score_version=score_version,
         ),
         "own_channel_trajectory": analyze_own_channel_early_trajectory(
             dataset["own_channel_videos"], dataset["own_channel_hourly_snapshots"],
@@ -1242,6 +1252,7 @@ def main(argv=None) -> int:
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--lookback-days", type=int, default=210)
     parser.add_argument("--min-samples", type=int, default=7)
+    parser.add_argument("--score-version", help="백테스트 점수 버전 (예: v1.2, v2.0). 기본값은 config.SCORE_VERSION.")
     parser.add_argument("--skip-btrack", action="store_true")
     args = parser.parse_args(argv)
     if args.lookback_days < 1 or args.min_samples < 1:
