@@ -160,6 +160,8 @@ def generate_json(prompt, model, attempts=3, image=None, required_field=None,
     result = {**result, "_provider": resolved_provider, "_model": current_model}
     if version:
         result["_model_version"] = version
+    else:
+        result.pop("_model_version", None)
     return result
 
 
