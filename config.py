@@ -85,7 +85,7 @@ def get_gemini_fallback_models(mode='daily') -> list[str]:
     elif mode in ('btrack', 'free'):
         models = ["gemini-2.5-flash-lite"]
     else:
-        models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite"]
+        models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
     primary = get_gemini_model(mode)
     return [model for model in dict.fromkeys(models) if model and model != primary]
 

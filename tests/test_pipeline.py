@@ -796,3 +796,54 @@ class ProviderTests(unittest.TestCase):
             ]
             self.assertTrue(telegram_notifier.send_message("test", parse_mode=None))
             self.assertNotIn("parse_mode", post.call_args.kwargs["json"])
+
+    def test_daily_quota_429_skips_exhausted_model_immediately_across_calls(self):
+        self.addCleanup(gemini_client.reset_exhausted_models)
+        session = Mock()
+        session.post.side_effect = [
+            response(429, {"error": {"message": "Generate content requests per day limit exceeded"}}),
+            response(200, {"modelVersion": "lite-v1", "candidates": [{
+                "finishReason": "STOP", "content": {"parts": [{"text": '{"topic": "ok1"}'}]},
+            }]}),
+            response(200, {"modelVersion": "lite-v1", "candidates": [{
+                "finishReason": "STOP", "content": {"parts": [{"text": '{"topic": "ok2"}'}]},
+            }]}),
+        ]
+        with patch.object(config, "GEMINI_PROVIDER", "ai_studio"), \
+                patch.object(config, "GEMINI_API_KEY", "test-key"), \
+                patch.object(gemini_client, "_ai_studio_session", return_value=session), \
+                patch.object(gemini_client.time, "sleep") as sleep:
+            r1 = gemini_client.generate_json("p1", "primary", attempts=3, fallback_models=["fallback"])
+            r2 = gemini_client.generate_json("p2", "primary", attempts=3, fallback_models=["fallback"])
+
+        self.assertEqual(r1["_model"], "fallback")
+        self.assertEqual(r2["_model"], "fallback")
+        sleep.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in session.post.call_args_list],
+            [
+                "https://generativelanguage.googleapis.com/v1beta/models/primary:generateContent",
+                "https://generativelanguage.googleapis.com/v1beta/models/fallback:generateContent",
+                "https://generativelanguage.googleapis.com/v1beta/models/fallback:generateContent",
+            ],
+        )
+
+    def test_rpm_429_still_retries_without_marking_daily_exhausted(self):
+        self.addCleanup(gemini_client.reset_exhausted_models)
+        session = Mock()
+        session.post.side_effect = [
+            response(429, {"error": {"message": "Requests per minute limit exceeded"}}),
+            response(200, {"modelVersion": "primary-v1", "candidates": [{
+                "finishReason": "STOP", "content": {"parts": [{"text": '{"topic": "ok"}'}]},
+            }]}),
+        ]
+        with patch.object(config, "GEMINI_PROVIDER", "ai_studio"), \
+                patch.object(config, "GEMINI_API_KEY", "test-key"), \
+                patch.object(gemini_client, "_ai_studio_session", return_value=session), \
+                patch.object(gemini_client.time, "sleep") as sleep:
+            result = gemini_client.generate_json("p", "primary", attempts=2, fallback_models=["fallback"])
+
+        self.assertEqual(result["_model"], "primary")
+        sleep.assert_called_once_with(2)
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(gemini_client._EXHAUSTED_DAILY_MODELS, set())

@@ -14,6 +14,18 @@ import config
 
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_EXHAUSTED_DAILY_MODELS: set[tuple[str, str]] = set()
+
+
+def reset_exhausted_models():
+    _EXHAUSTED_DAILY_MODELS.clear()
+
+
+def _is_daily_quota_exhausted(status, message):
+    if status != 429 or not message:
+        return False
+    lowered = message.lower()
+    return any(token in lowered for token in ("requests per day", "perday", "per day"))
 
 
 def safe_error(error):
@@ -54,7 +66,7 @@ def _post(provider, model, payload):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent"
         return _ai_studio_session().post(
             url, headers={"x-goog-api-key": config.GEMINI_API_KEY},
-            json=payload, timeout=(10, 90),
+            json=payload, timeout=(10, 45),
         )
 
     location = config.GOOGLE_CLOUD_LOCATION
@@ -62,7 +74,7 @@ def _post(provider, model, payload):
     project = quote(config.GOOGLE_CLOUD_PROJECT, safe="")
     url = (f"https://{host}/v1/projects/{project}/locations/{location}"
            f"/publishers/google/models/{model_path}:generateContent")
-    return _session().post(url, json=payload, timeout=(10, 90))
+    return _session().post(url, json=payload, timeout=(10, 45))
 
 
 def _response_text(body):
@@ -96,12 +108,18 @@ def _generate(provider, model, fallback_models, attempts, parts, generation_conf
         raise _GenerationError("GEMINI_PROVIDER는 ai_studio 또는 vertexai이어야 합니다", model)
     if config.GEMINI_THINKING_LEVEL:
         generation_config["thinkingConfig"] = {"thinkingLevel": config.GEMINI_THINKING_LEVEL}
+    candidates = [
+        m for m in dict.fromkeys([model, *(fallback_models or [])])
+        if (provider, m) not in _EXHAUSTED_DAILY_MODELS
+    ]
+    if not candidates:
+        raise _GenerationError("모든 Gemini 모델의 일일 무료 할당량이 소진되었습니다", model)
     payload = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": generation_config,
     }
     attempts = max(1, attempts)
-    for current_model in dict.fromkeys([model, *(fallback_models or [])]):
+    for current_model in candidates:
         for attempt in range(1, attempts + 1):
             try:
                 response = _post(provider, current_model, payload)
@@ -116,6 +134,11 @@ def _generate(provider, model, fallback_models, attempts, parts, generation_conf
                 detail = body.get("error") if isinstance(body, dict) else None
                 message = detail.get("message") if isinstance(detail, dict) else None
                 error = f"HTTP {status}: {message or response.reason}"
+                if _is_daily_quota_exhausted(status, message or ""):
+                    _EXHAUSTED_DAILY_MODELS.add((provider, current_model))
+                    error = safe_error(error)
+                    print(f"  ⚠️ Gemini ({provider}) {current_model} 일일 한도 소진 → 즉시 전환: {error}")
+                    break
                 retryable = status in RETRYABLE_STATUS_CODES
                 if not retryable and status not in {400, 404}:
                     raise _GenerationError(safe_error(error), current_model)
