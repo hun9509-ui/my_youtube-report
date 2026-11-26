@@ -1,7 +1,7 @@
 import json
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from types import SimpleNamespace
@@ -362,10 +362,12 @@ class BTrackCollectorTest(unittest.TestCase):
         ]
         self.db.table.side_effect = {"trend_sources": self.sources, "trend_videos": self.videos}.__getitem__
         self.output = StringIO()
-        self.enterContext(redirect_stdout(self.output))
-        self.enterContext(patch.object(collector, "get_db", return_value=self.db))
-        self.enterContext(patch.object(collector, "QuotaGuard"))
-        self.collect = self.enterContext(patch.object(collector, "collect_channel_videos"))
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(redirect_stdout(self.output))
+        stack.enter_context(patch.object(collector, "get_db", return_value=self.db))
+        stack.enter_context(patch.object(collector, "QuotaGuard"))
+        self.collect = stack.enter_context(patch.object(collector, "collect_channel_videos"))
 
     def test_refreshes_recent_views_or_baseline_without_touching_scan_state(self):
         now = datetime.now(timezone.utc)
@@ -455,9 +457,11 @@ class BTrackGeminiTest(unittest.TestCase):
     def setUp(self):
         self.db = Mock()
         self.output = StringIO()
-        self.enterContext(redirect_stdout(self.output))
-        self.enterContext(patch.object(gemini, "get_db", return_value=self.db))
-        self.enterContext(patch.object(gemini.time, "sleep"))
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(redirect_stdout(self.output))
+        stack.enter_context(patch.object(gemini, "get_db", return_value=self.db))
+        stack.enter_context(patch.object(gemini.time, "sleep"))
 
     def test_cluster_uses_all_recent_mentions_and_looks_up_high_entity_ids(self):
         mentions, entities, clusters = Mock(), Mock(), Mock()

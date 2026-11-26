@@ -1,7 +1,7 @@
 import builtins
 import json
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
@@ -139,17 +139,19 @@ class FakeQuery:
 
 class RepairTest(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(TemporaryDirectory()))
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.root = Path(stack.enter_context(TemporaryDirectory()))
         self.backups = self.root / "backups"
-        self.output = self.enterContext(redirect_stdout(StringIO()))
-        self.errors = self.enterContext(redirect_stderr(StringIO()))
-        self.analyze = self.enterContext(patch.object(repair.gemini, "analyze_video"))
-        self.analyze_own = self.enterContext(patch.object(repair.gemini, "analyze_own_video"))
-        self.comments = self.enterContext(patch.object(repair.yt, "get_video_comments"))
-        self.deepseek = self.enterContext(patch.object(repair.ds, "analyze_comments"))
-        self.own_deepseek = self.enterContext(patch.object(repair.ds, "analyze_own_video_comments"))
-        self.youtube = self.enterContext(patch.object(repair, "build"))
-        self.enterContext(patch.object(repair.config, "YOUTUBE_API_KEY", ""))
+        self.output = stack.enter_context(redirect_stdout(StringIO()))
+        self.errors = stack.enter_context(redirect_stderr(StringIO()))
+        self.analyze = stack.enter_context(patch.object(repair.gemini, "analyze_video"))
+        self.analyze_own = stack.enter_context(patch.object(repair.gemini, "analyze_own_video"))
+        self.comments = stack.enter_context(patch.object(repair.yt, "get_video_comments"))
+        self.deepseek = stack.enter_context(patch.object(repair.ds, "analyze_comments"))
+        self.own_deepseek = stack.enter_context(patch.object(repair.ds, "analyze_own_video_comments"))
+        self.youtube = stack.enter_context(patch.object(repair, "build"))
+        stack.enter_context(patch.object(repair.config, "YOUTUBE_API_KEY", ""))
 
     def run_cli(self, client, steps, *flags):
         report = self.root / f"report-{len(list(self.root.glob('report-*')))}.json"
