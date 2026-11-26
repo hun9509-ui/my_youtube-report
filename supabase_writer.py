@@ -771,7 +771,7 @@ def get_weekly_trend_summary(days_back: int = 7) -> dict:
             'period_days': days_back,
         }
     except Exception as e:
-        raise RuntimeError(f"주간 트렌드 조회 실패: {safe_error(e)}") from e
+        raise RuntimeError(f"주간 트렌드 조회 실패: {safe_error(e)}") from None
 
 
 def get_all_tracked_video_ids() -> list:

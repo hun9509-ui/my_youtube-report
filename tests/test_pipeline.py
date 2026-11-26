@@ -1,9 +1,14 @@
 import json
 import sys
 import unittest
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+
+import httpx
+from postgrest import SyncPostgrestClient
 
 import main
 import config
@@ -159,7 +164,7 @@ class OwnChannelTests(unittest.TestCase):
         self.video = {**video("own-video", days=1), "comment_count": 1}
         self.gemini = Mock(return_value={"topic": "valid"})
         self.db = Mock()
-        self.db.is_own_video_analyzed.return_value = False
+        self.db.get_own_channel_state.return_value = {}
         self.sheets = Mock()
         self.alert = Mock(return_value=True)
         self.error_alert = Mock()
@@ -200,6 +205,48 @@ class OwnChannelTests(unittest.TestCase):
         self.alert.assert_called_once()
         self.error_alert.assert_called_once()
 
+    def test_recovers_comments_without_repeating_gemini_analysis(self):
+        gemini_raw = {"topic": "previous analysis"}
+        self.db.get_own_channel_state.return_value = {
+            "own-video": {"gemini_raw": gemini_raw, "deepseek_raw": {"error": "temporary failure"}},
+        }
+        self.comments.return_value = [{"text": "new comment"}]
+        recovered = {"summary": "recovered analysis"}
+        with patch.object(main.ds, "analyze_own_video_comments", return_value=recovered) as analyze:
+            self.assertIs(main.run_own_channel_daily(), True)
+
+        self.db.get_own_channel_state.assert_called_once_with(["own-video"])
+        self.gemini.assert_not_called()
+        self.comments.assert_called_once_with(
+            "own-video", max_comments=config.TOP_COMMENTS_COUNT, raise_on_error=True,
+        )
+        analyze.assert_called_once_with("own-video", self.comments.return_value, "longform")
+        self.db.save_own_analysis.assert_called_once_with("own-video", gemini_raw, recovered)
+        self.sheets.save_own_analysis.assert_called_once_with(self.video, gemini_raw, recovered)
+        self.alert.assert_called_once_with(self.video, gemini_raw, recovered)
+
+    def test_failed_comment_retry_leaves_prior_result_intact(self):
+        self.db.get_own_channel_state.return_value = {
+            "own-video": {"gemini_raw": {"topic": "previous analysis"}, "deepseek_raw": {"error": "retry"}},
+        }
+        self.comments.side_effect = RuntimeError("temporary failure")
+        self.assertIs(main.run_own_channel_daily(), False)
+        self.gemini.assert_not_called()
+        self.db.save_own_analysis.assert_not_called()
+        self.sheets.save_own_analysis.assert_not_called()
+        self.alert.assert_not_called()
+        self.error_alert.assert_called_once()
+
+    def test_completed_own_analysis_skips_gemini_and_comments(self):
+        self.db.get_own_channel_state.return_value = {
+            "own-video": {"gemini_raw": {"topic": "valid"}, "deepseek_raw": {"summary": "finished"}},
+        }
+        with patch.object(main.tg, "send_message", return_value=True):
+            self.assertIs(main.run_own_channel_daily(), True)
+        self.gemini.assert_not_called()
+        self.comments.assert_not_called()
+        self.db.save_own_analysis.assert_not_called()
+
     def test_db_failure_blocks_sheets_and_completion_alert(self):
         self.db.save_own_analysis.return_value = False
         self.assertIs(main.run_own_channel_daily(), False)
@@ -220,6 +267,22 @@ class OwnChannelTests(unittest.TestCase):
             execute.return_value.data.append({"topic": "valid", "gemini_raw": {"topic": "valid"}})
             self.assertIs(supabase_writer.is_own_video_analyzed("own-video"), True)
         select.assert_called_with("video_id,topic,gemini_raw")
+
+    def test_own_state_returns_valid_rows_with_comment_status(self):
+        valid = {"video_id": "own-video", "topic": "valid", "gemini_raw": {"topic": "valid"},
+                 "deepseek_raw": {"error": "temporary failure"}}
+        client = Mock()
+        select = client.table.return_value.select
+        query = select.return_value.in_.return_value.limit.return_value
+        query.execute.return_value.data = [
+            valid,
+            {**valid, "video_id": "blank-topic", "topic": ""},
+            {**valid, "video_id": "failed-gemini", "gemini_raw": {"error": "quota"}},
+        ]
+        with patch.object(supabase_writer, "get_client", return_value=client):
+            state = supabase_writer.get_own_channel_state(["own-video", "blank-topic", "failed-gemini"])
+        self.assertEqual(state, {"own-video": valid})
+        select.assert_called_once_with("video_id,topic,gemini_raw,deepseek_raw")
 
     def test_own_db_normalizes_text_and_requires_an_upserted_row(self):
         client = Mock()
@@ -270,6 +333,14 @@ class CollectionAndConfigTests(unittest.TestCase):
                             DEEPSEEK_API_KEY=None, GEMINI_API_KEY=None):
             self.assertIs(main.validate_env("b-track-score"), True)
 
+    def test_b_track_run_allows_vertex_adc_without_api_keys(self):
+        with patch.multiple(config, SUPABASE_URL="test-url", SUPABASE_KEY="test-db-key",
+                            YOUTUBE_API_KEY="test-youtube-key", TEXT_ANALYSIS_ENGINE="deepseek",
+                            GEMINI_PROVIDER="vertexai", DEEPSEEK_API_KEY=None, GEMINI_API_KEY=None):
+            self.assertIs(main.validate_env("b-track-run"), True)
+            with patch.object(config, "GEMINI_PROVIDER", "ai_studio"):
+                self.assertIs(main.validate_env("b-track-run"), False)
+
     def test_b_track_run_stops_before_clustering_when_scan_raises(self):
         worker = Mock()
         worker.run_broad_scan.side_effect = RuntimeError("scan failed")
@@ -278,6 +349,113 @@ class CollectionAndConfigTests(unittest.TestCase):
         worker.run_collect.assert_called_once_with()
         worker.run_broad_scan.assert_called_once_with()
         worker.run_cluster.assert_not_called()
+
+
+class PaginationTests(unittest.TestCase):
+    @contextmanager
+    def postgrest(self, tables, requests):
+        base_url = "https://example.invalid"
+
+        def respond(request):
+            table = request.url.path.rsplit("/", 1)[-1]
+            params = request.url.params
+            self.assertEqual(len(params.get_list("offset")), 1)
+            self.assertEqual(len(params.get_list("limit")), 1)
+            self.assertIn("order", params)
+            offset, limit = int(params["offset"]), int(params["limit"])
+            requests.append((table, offset, params["order"]))
+            return httpx.Response(200, json=tables[table][offset:offset + limit])
+
+        with SyncPostgrestClient(base_url) as db, \
+                httpx.Client(base_url=base_url, transport=httpx.MockTransport(respond)) as http, \
+                patch.object(db.session, "request", side_effect=http.request), \
+                patch.object(supabase_writer, "get_client", return_value=db):
+            yield db
+
+    def test_page_requests_use_one_offset_and_limit_each(self):
+        rows = [{"id": i} for i in range(3)]
+        requests = []
+        with self.postgrest({"sample": rows}, requests) as db:
+            result = list(supabase_writer._read_pages(
+                lambda: db.table("sample").select("id").order("id"), page_size=2,
+            ))
+        self.assertEqual(result, rows)
+        self.assertEqual([offset for _, offset, _ in requests], [0, 2])
+
+    def test_snapshot_targets_include_all_competitor_and_own_pages(self):
+        tables = {
+            "videos": [{"video_id": f"competitor-{i:04}"} for i in range(1001)],
+            "own_channel_videos": [{"video_id": f"own-{i:04}"} for i in range(1001)],
+        }
+        requests = []
+        with self.postgrest(tables, requests):
+            rows = supabase_writer.get_all_videos_for_snapshot()
+        self.assertEqual(len(rows), 2002)
+        self.assertEqual(rows[1000], {"video_id": "competitor-1000", "source_type": "competitor"})
+        self.assertEqual(rows[-1], {
+            "video_id": "own-1000", "source_type": "own", "channel_title": config.OWN_CHANNEL,
+        })
+        self.assertEqual([(table, offset) for table, offset, _ in requests], [
+            (table, offset) for table in tables for offset in (0, 500, 1000)
+        ])
+
+    def test_score_backfill_paginates_all_tables_and_uses_latest_valid_daily_row(self):
+        videos = [{"video_id": f"v{i:04}", "title": str(i)} for i in range(1002)]
+        valid = {"topic": "valid"}
+        failed_daily = {"video_id": "v1000", "id": 2000, "gemini_raw": {"error": "quota"}}
+        latest_valid = {"video_id": "v1000", "id": 0, "gemini_raw": valid}
+        tables = {
+            "video_scores": [{"video_id": f"scored-{i:04}"} for i in range(1000)] + [{"video_id": "v1001"}],
+            "videos": videos,
+            "initial_analysis": [{"video_id": v["video_id"], "id": i} for i, v in enumerate(videos)],
+            "daily_analysis": [failed_daily] + [
+                {"video_id": f"v{i:04}", "id": i + 1, "gemini_raw": valid} for i in range(999, -1, -1)
+            ] + [latest_valid, {**latest_valid, "id": -1},
+                 {"video_id": "only-failed", "id": -2, "gemini_raw": {"error": "quota"}}],
+        }
+        requests = []
+        with self.postgrest(tables, requests):
+            initial, daily = supabase_writer.get_score_backfill_rows()
+        self.assertEqual(len(initial), 1001)
+        self.assertEqual(initial[-1][0], videos[1000])
+        self.assertEqual(len(daily), 1001)
+        self.assertEqual(daily[-1], (videos[1000], latest_valid))
+        for table in tables:
+            self.assertIn((table, 1000), [(name, offset) for name, offset, _ in requests])
+        self.assertTrue(all(order == "analysis_date.desc,id.desc"
+                            for table, _, order in requests if table == "daily_analysis"))
+
+    def test_comment_backfill_limit_counts_only_rows_needing_reanalysis(self):
+        rows = [{"video_id": str(i), "deepseek_raw": {"emotion_temperature": {"comfort": 1}}}
+                for i in range(500)]
+        rows += [{"video_id": str(i), "deepseek_raw": {}} for i in range(500, 1001)]
+        requests = []
+        with self.postgrest({"initial_analysis": rows}, requests):
+            pending = supabase_writer.get_videos_needing_comment_reanalysis(limit=1)
+        self.assertEqual(pending, [{"video_id": "500", "title": "", "comment_count": 0}])
+        self.assertEqual([offset for _, offset, _ in requests], [0, 500])
+
+
+class ErrorLoggingTests(unittest.TestCase):
+    def test_initial_batch_and_history_extend_redact_errors_before_logging_or_alerting(self):
+        error = "https://youtube.googleapis.com/test?part=snippet&key=SECRET_KEY&alt=json"
+        db = Mock()
+        db.get_oldest_video_date_by_channel.return_value = datetime.now(timezone.utc)
+        with patch.object(main, "db", db), \
+                patch.multiple(config, INITIAL_BATCHES={1: ["test"]}, TARGET_CHANNELS={"test": "channel"}), \
+                patch.object(main, "collect_channel", side_effect=RuntimeError(error)), \
+                patch.object(main.yt, "get_channel_videos", side_effect=RuntimeError(error)), \
+                patch.object(main.tg, "send_error_alert") as alert, \
+                patch.object(main.tg, "send_message"), \
+                redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr:
+            main.run_initial_batch(1)
+            main.run_history_extend()
+
+        self.assertNotIn("SECRET_KEY", stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(stdout.getvalue().count("key=[redacted]"), 2)
+        self.assertEqual(alert.call_count, 2)
+        for call in alert.call_args_list:
+            self.assertEqual(call.args[0], error.replace("SECRET_KEY", "[redacted]"))
 
 
 class ProviderTests(unittest.TestCase):
