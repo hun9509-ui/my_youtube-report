@@ -5,29 +5,15 @@ B-track Gemini 브로드 스캔 모듈
 import json
 import re
 import time
-from datetime import datetime, timezone
-
-import vertexai
-from vertexai.generative_models import GenerativeModel
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 import config
 import b_track_config as btc
+from b_track_config import _read_pages, _safe_error
 import deepseek_processor as ds
 import gemini_analyzer as ga
 from supabase import create_client
-
-_vertex_initialized = False
-
-
-def _init_vertex():
-    global _vertex_initialized
-    if not _vertex_initialized:
-        vertexai.init(
-            project=config.GOOGLE_CLOUD_PROJECT,
-            location=config.GOOGLE_CLOUD_LOCATION,
-        )
-        _vertex_initialized = True
-
 
 def get_db():
     return create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
@@ -76,9 +62,10 @@ def _extract_json_list(text: str) -> list:
     if block:
         text = block.group(1).strip()
     arr = re.search(r'\[[\s\S]*\]', text)
-    if arr:
-        return json.loads(arr.group())
-    return json.loads(text)
+    items = json.loads(arr.group() if arr else text)
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("브로드 스캔 응답은 JSON 객체 배열이어야 합니다")
+    return items
 
 
 def _normalize(name: str) -> str:
@@ -147,9 +134,9 @@ def run_broad_scan(max_videos: int = None):
         'video_id,channel_id,channel_title,title,description_short,view_count,published_at'
     ).eq('broad_scan_done', False).order(
         'view_over_baseline', desc=True
-    ).limit(max_videos).execute()
+    ).order('video_id')
 
-    videos = unscanned.data
+    videos = _read_pages(unscanned, max_rows=max_videos)
     if not videos:
         print("  ℹ️ 브로드 스캔할 영상 없음")
         return 0
@@ -180,21 +167,31 @@ def run_broad_scan(max_videos: int = None):
         job_id = job_resp.data[0]['id'] if job_resp.data else None
 
         try:
-            text = ds.call_deepseek_raw(prompt)
             try:
+                text = ds.call_deepseek_raw(prompt)
                 results = _extract_json_list(text) if text else []
-            except Exception:
+            except Exception as e:
+                print(f"  ⚠️ DeepSeek 브로드 스캔 실패: {_safe_error(e)}")
                 results = []
-            if not results:
-                # DeepSeek이 배열을 못 뽑으면 무료 Gemini 키로 폴백
-                text = ga.genai_generate_text(prompt)
+            if results:
+                get_model = getattr(config, 'get_deepseek_model', lambda **_: 'deepseek')
+                used_model = get_model(complex_task=False)
+            else:
+                used_model = btc.BROAD_SCAN_MODEL
+                generate_with_meta = getattr(ga, 'genai_generate_text_with_meta', None)
+                if callable(generate_with_meta):
+                    text, actual_model = generate_with_meta(prompt)
+                    used_model = actual_model or used_model
+                else:
+                    text = ga.genai_generate_text(prompt, model_name=used_model)
                 results = _extract_json_list(text)
         except Exception as e:
-            print(f"  ❌ 배치 {batch_start//batch_size + 1} Gemini 오류: {e}")
+            error = _safe_error(e)
+            print(f"  ❌ 배치 {batch_start//batch_size + 1} Gemini 오류: {error}")
             if job_id:
                 db.table('gemini_jobs').update({
                     'status': 'failed',
-                    'error_summary': str(e)[:500],
+                    'error_summary': error,
                     'finished_at': datetime.now(timezone.utc).isoformat(),
                 }).eq('id', job_id).execute()
             time.sleep(2)
@@ -249,7 +246,7 @@ def run_broad_scan(max_videos: int = None):
                 ).execute()
                 batch_entities += len(mention_rows)
             except Exception as me:
-                print(f"    ⚠️ mention skip (vid={vid}): {str(me)[:80]}")
+                print(f"    ⚠️ mention skip (vid={vid}): {_safe_error(me)[:80]}")
                 continue
 
         # broad_scan_done 업데이트
@@ -263,6 +260,7 @@ def run_broad_scan(max_videos: int = None):
         if job_id:
             db.table('gemini_jobs').update({
                 'status': 'done',
+                'model': used_model,
                 'finished_at': datetime.now(timezone.utc).isoformat(),
                 'estimated_cost_usd': round(len(batch) * 0.00005, 6),
             }).eq('id', job_id).execute()
@@ -282,23 +280,17 @@ def run_cluster():
     db = get_db()
     print("📊 트렌드 클러스터 집계 중...")
 
-    # 최근 7일 언급 집계 (SQL 직접)
-    from supabase import create_client
-    # Supabase client를 통해 RPC 대신 Python으로 집계
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    mentions = _read_pages(
+        db.table('entity_mentions').select('entity_id,channel_id,view_count_at_scan,published_at')
+        .gte('created_at', cutoff).order('entity_id').order('video_id')
+    )
 
-    cutoff = (datetime.now(timezone.utc) - __import__('datetime').timedelta(days=7)).isoformat()
-
-    mentions_resp = db.table('entity_mentions').select(
-        'entity_id,channel_id,view_count_at_scan,published_at'
-    ).gte('created_at', cutoff).execute()
-
-    mentions = mentions_resp.data
     if not mentions:
         print("  ℹ️ 최근 7일 언급 없음")
         return
 
     # entity별 집계
-    from collections import defaultdict
     agg = defaultdict(lambda: {
         'channels': set(), 'views': 0, 'count': 0
     })
@@ -309,14 +301,18 @@ def run_cluster():
         agg[eid]['count'] += 1
 
     # 상위 엔티티 → 클러스터 갱신
-    entities_resp = db.table('trend_entities').select('id,name,category').execute()
-    entity_map = {e['id']: e for e in entities_resp.data}
+    top_eids = sorted(agg, key=lambda eid: -agg[eid]['count'])[:100]
+    entities = _read_pages(
+        db.table('trend_entities').select('id,name,category').in_('id', top_eids).order('id')
+    )
+    entity_map = {e['id']: e for e in entities}
 
     updated = 0
-    for eid, stats in sorted(agg.items(), key=lambda x: -x[1]['count'])[:100]:
+    for eid in top_eids:
         if eid not in entity_map:
             continue
         entity = entity_map[eid]
+        stats = agg[eid]
         n_channels = len(stats['channels'])
         n_mentions = stats['count']
         total_views = stats['views']

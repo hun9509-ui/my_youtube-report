@@ -18,11 +18,13 @@ from typing import Any
 from supabase import create_client
 
 import config
+from b_track_config import _read_pages
 
 
 WINDOW_7D = 7
 WINDOW_30D = 30
 WINDOW_90D = 90
+KST = timezone(timedelta(hours=9))
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -68,10 +70,10 @@ def _trend_stage(
         return "fatigue", "언급 채널은 많지만 평균 대비 성과가 약해 피로 신호로 판단"
     if mention_count_7d >= 2 and distinct_channels_30d >= 3 and avg_baseline >= 1.8 and hit_ratio >= 0.5:
         return "breakout", "최근 언급과 채널 확산, 평균 대비 성과가 함께 높음"
-    if mention_count_30d >= 3 and distinct_channels_30d >= 3:
-        return "rising", "여러 채널에서 반복 감지되어 상승 신호로 판단"
     if mention_count_30d >= 8 and distinct_channels_30d >= 5:
         return "mainstream", "이미 여러 채널에서 넓게 다뤄지는 대중화 단계"
+    if mention_count_30d >= 3 and distinct_channels_30d >= 3:
+        return "rising", "여러 채널에서 반복 감지되어 상승 신호로 판단"
     return "seed", "아직 제한된 채널에서만 감지되는 초기 신호"
 
 
@@ -320,20 +322,25 @@ def _load_mentions_for_entities(db, entity_ids: list[int]) -> dict[int, list[dic
     if not entity_ids:
         return mentions_by_entity
 
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=WINDOW_90D + 1)).isoformat()
     rows = []
-    for i in range(0, len(entity_ids), 100):
-        batch = entity_ids[i:i + 100]
-        resp = db.table("entity_mentions").select("*").in_("entity_id", batch).execute()
-        rows.extend(resp.data or [])
+    for i in range(0, len(entity_ids), 50):
+        batch = entity_ids[i:i + 50]
+        query = (
+            db.table("entity_mentions").select("*").in_("entity_id", batch)
+            .or_(f"published_at.gte.{cutoff},and(published_at.is.null,created_at.gte.{cutoff})")
+            .order("entity_id").order("video_id")
+        )
+        rows.extend(_read_pages(query))
 
     video_ids = sorted({r.get("video_id") for r in rows if r.get("video_id")})
     videos = {}
     for i in range(0, len(video_ids), 100):
         batch = video_ids[i:i + 100]
-        resp = db.table("trend_videos").select(
+        query = db.table("trend_videos").select(
             "video_id,title,channel_title,view_count,view_over_baseline,video_type"
-        ).in_("video_id", batch).execute()
-        for video in resp.data or []:
+        ).in_("video_id", batch).order("video_id")
+        for video in _read_pages(query):
             videos[video["video_id"]] = video
 
     for row in rows:
@@ -353,9 +360,10 @@ def _load_mentions_for_entities(db, entity_ids: list[int]) -> dict[int, list[dic
 def run_score(max_entities: int = 500) -> int:
     """B-track 엔티티 점수/답변카드 생성 후 Supabase에 저장."""
     db = _db()
-    entities = db.table("trend_entities").select(
+    query = db.table("trend_entities").select(
         "id,name,entity_type,category"
-    ).order("last_seen_at", desc=True).limit(max_entities).execute().data or []
+    ).order("last_seen_at", desc=True).order("id")
+    entities = _read_pages(query, max_rows=max_entities)
 
     if not entities:
         print("  ℹ️ 점수화할 trend_entities 없음")
@@ -365,12 +373,14 @@ def run_score(max_entities: int = 500) -> int:
     mentions_by_entity = _load_mentions_for_entities(db, entity_ids)
     scores = []
     cards = []
+    now = datetime.now(timezone.utc)
+    scored_at = now.astimezone(KST).date()
 
     for entity in entities:
         mentions = mentions_by_entity.get(entity["id"], [])
         if not mentions:
             continue
-        score, card = score_entity(entity, mentions)
+        score, card = score_entity(entity, mentions, scored_at=scored_at, now=now)
         scores.append(score)
         cards.append(card)
 

@@ -3,6 +3,9 @@ B-track 트렌드 인텔리전스 설정
 패션/뷰티/라이프스타일/사회 유행 레이더
 """
 
+import os
+import re
+
 # ===== 초기 Seed 채널 =====
 # source_ref: 유튜브 채널 ID 또는 핸들(@로 시작)
 # category_hint: 카테고리 힌트 (쉼표 구분)
@@ -40,6 +43,7 @@ BROAD_SCAN_BATCH_SIZE = 40      # Gemini 한 번에 처리할 영상 수 (호출
 MAX_VIDEOS_PER_RUN = 2000       # 1회 실행당 최대 처리 영상 수 (브로드 스캔, Gemini 크레딧)
 MIN_VIEW_COUNT = 1000           # 이 이하 조회수는 수집 제외
 COLLECT_REFRESH_HOURS = 20      # 이 시간 내 이미 수집한 채널은 이번 회차 skip (오래된 것부터 처리)
+B_TRACK_REFRESH_DAYS = 90
 SHORTS_MAX_SECONDS = 180        # 이 이하 길이는 숏폼으로 분류 (초, 유튜브 공식 Shorts 상한 3분). baseline 분리 기준
 
 # ===== YouTube API 유닛 예산 (절대 제약: A-track 침범 금지) =====
@@ -60,8 +64,38 @@ QUOTA_COST = {
 }
 
 # ===== Gemini 설정 =====
-BROAD_SCAN_MODEL = "gemini-2.5-flash"
-TREND_PACKET_MODEL = "gemini-2.5-flash"
+BROAD_SCAN_MODEL = os.getenv("BTRACK_SCAN_MODEL", "gemini-3.5-flash-lite")
+TREND_PACKET_MODEL = os.getenv("BTRACK_PACKET_MODEL", "gemini-3.5-flash-lite")
+
+
+def _safe_error(error):
+    """Mask credentials before delegating to the shared error formatter."""
+    import config
+
+    message = re.sub(r"""([?&]key=)[^&\s"'<>]+""", r"\1[redacted]", str(error))
+    for name in ("YOUTUBE_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY", "SUPABASE_KEY"):
+        secret = getattr(config, name, None)
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    try:
+        from gemini_client import safe_error
+    except ImportError:
+        return message[:500]
+    return safe_error(message)[:500]
+
+
+def _read_pages(query, page_size=1000, *, max_rows=None):
+    """Read an explicitly ordered PostgREST query with inclusive ranges."""
+    rows = []
+    while max_rows is None or len(rows) < max_rows:
+        offset = len(rows)
+        size = page_size if max_rows is None else min(page_size, max_rows - offset)
+        page = query.range(offset, offset + size - 1).execute().data or []
+        rows.extend(page)
+        if len(page) < size:
+            break
+    return rows
+
 
 # ===== view_over_baseline 기준 =====
 # 채널 평균 대비 이 배수 이상이어야 deep dive 후보

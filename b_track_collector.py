@@ -4,8 +4,10 @@ trend_sources에 등록된 채널에서 영상 메타데이터를 수집해 tren
 """
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import config
 import b_track_config as btc
+from b_track_config import _read_pages, _safe_error
 from b_track_quota import QuotaGuard, QuotaExceeded
 from youtube_collector import parse_duration
 from supabase import create_client
@@ -146,7 +148,10 @@ def init_seed_sources():
             continue
 
         # 채널 ID 해석
-        channel_id, resolved_title = resolve_channel_id(ch['source_ref'])
+        try:
+            channel_id, resolved_title = resolve_channel_id(ch['source_ref'])
+        except Exception as e:
+            raise RuntimeError(_safe_error(e)) from None
         if not channel_id:
             print(f"  ⚠️ {ch['source_name']}: 채널 ID 해석 실패 ({ch['source_ref']})")
             continue
@@ -173,11 +178,14 @@ def run_collect(max_sources: int = None):
 
     # never-collected(NULL) 먼저 → 그다음 오래된 것부터.
     # (PostgREST asc는 NULLS LAST가 기본이라 두 단계로 명시 분리)
-    never = db.table('trend_sources').select('*').eq('active', True) \
-        .is_('last_collected_at', 'null').order('priority', desc=True).execute().data
-    older = db.table('trend_sources').select('*').eq('active', True) \
-        .not_.is_('last_collected_at', 'null') \
-        .order('last_collected_at', desc=False).execute().data
+    never = _read_pages(
+        db.table('trend_sources').select('*').eq('active', True)
+        .is_('last_collected_at', 'null').order('priority', desc=True).order('id')
+    )
+    older = _read_pages(
+        db.table('trend_sources').select('*').eq('active', True)
+        .not_.is_('last_collected_at', 'null').order('last_collected_at').order('id')
+    )
     sources = never + older
     if max_sources:
         sources = sources[:max_sources]
@@ -186,8 +194,10 @@ def run_collect(max_sources: int = None):
         return 0
     print(f"  대상: never-collected {len(never)}개 + 기수집 {len(older)}개")
 
-    refresh_cutoff = datetime.now(timezone.utc) - timedelta(hours=btc.COLLECT_REFRESH_HOURS)
-    total_new, processed, skipped, stopped = 0, 0, 0, False
+    now = datetime.now(timezone.utc)
+    refresh_cutoff = now - timedelta(hours=btc.COLLECT_REFRESH_HOURS)
+    video_cutoff = now - timedelta(days=btc.B_TRACK_REFRESH_DAYS)
+    total_new, total_updated, processed, skipped, stopped = 0, 0, 0, 0, False
 
     for src in sources:
         # 최근 수집한 채널은 이번 회차 skip
@@ -206,11 +216,11 @@ def run_collect(max_sources: int = None):
         try:
             videos = collect_channel_videos(channel_id, channel_title, guard)
         except QuotaExceeded as e:
-            print(f"\n🛑 유닛 예산 소진 — 수집 중단, 익일 이월 ({channel_title})\n   {e}")
+            print(f"\n🛑 유닛 예산 소진 — 수집 중단, 익일 이월 ({channel_title})\n   {_safe_error(e)}")
             stopped = True
             break
         except Exception as e:
-            print(f"\n⚠️ {channel_title}: 수집 실패, 스킵 ({e})")
+            print(f"\n⚠️ {channel_title}: 수집 실패, 스킵 ({_safe_error(e)})")
             db.table('trend_sources').update({
                 'last_collected_at': datetime.now(timezone.utc).isoformat(),
             }).eq('id', src['id']).execute()
@@ -243,27 +253,48 @@ def run_collect(max_sources: int = None):
         print(f"\n📡 {channel_title}: 영상 {len(videos)}개 (숏폼 {n_short}/롱폼 {n_long}) "
               f"평균 숏폼 {round(type_avg.get('shorts',0)):,}/롱폼 {round(type_avg.get('longform',0)):,} ({guard.report()})")
 
-        # 이미 있는 video_id 제외
-        existing_ids = set()
+        existing_map = {}
         for i in range(0, len(videos), 100):
             batch_ids = [v['video_id'] for v in videos[i:i+100]]
-            resp = db.table('trend_videos').select('video_id').in_('video_id', batch_ids).execute()
-            existing_ids.update(r['video_id'] for r in resp.data)
+            resp = db.table('trend_videos').select(
+                'video_id,view_count,view_over_baseline'
+            ).in_('video_id', batch_ids).execute()
+            existing_map.update({r['video_id']: r for r in resp.data})
 
         seen = set()
         new_videos = []
+        updated = 0
         for v in videos:
-            if v['video_id'] not in existing_ids and v['video_id'] not in seen:
-                seen.add(v['video_id'])
+            vid = v['video_id']
+            if vid in seen:
+                continue
+            seen.add(vid)
+            if vid not in existing_map:
                 new_videos.append(v)
+                continue
+
+            published_at = datetime.fromisoformat(v['published_at'].replace('Z', '+00:00'))
+            if published_at < video_cutoff:
+                continue
+            previous = existing_map[vid]
+            old_baseline = previous['view_over_baseline']
+            if old_baseline is not None:
+                difference = abs(Decimal(str(v['view_over_baseline'])) - Decimal(str(old_baseline)))
+                if previous['view_count'] == v['view_count'] and difference < Decimal('0.01'):
+                    continue
+            db.table('trend_videos').update({
+                field: v[field] for field in (
+                    'view_count', 'like_count', 'comment_count', 'channel_avg_views', 'view_over_baseline'
+                )
+            }).eq('video_id', vid).execute()
+            updated += 1
 
         if new_videos:
             for i in range(0, len(new_videos), 100):
                 db.table('trend_videos').insert(new_videos[i:i+100]).execute()
             total_new += len(new_videos)
-            print(f"  ✅ 신규 {len(new_videos)}개 저장")
-        else:
-            print("  모두 기존 수집됨")
+        total_updated += updated
+        print(f"  ✅ 신규 {len(new_videos)}개 / 갱신 {updated}개")
 
         db.table('trend_sources').update({
             'last_collected_at': datetime.now(timezone.utc).isoformat(),
@@ -272,5 +303,6 @@ def run_collect(max_sources: int = None):
         processed += 1
 
     tag = "예산소진 중단" if stopped else "완료"
-    print(f"\n✅ 수집 {tag}: 처리 {processed}채널 / skip {skipped} / 신규 {total_new}개 / {guard.report()}")
+    print(f"\n✅ 수집 {tag}: 처리 {processed}채널 / skip {skipped} / "
+          f"신규 {total_new}개 / 갱신 {total_updated}개 / {guard.report()}")
     return total_new

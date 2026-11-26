@@ -17,23 +17,13 @@ import re
 import time
 from datetime import datetime, timezone
 
-import vertexai
-from vertexai.generative_models import GenerativeModel
 from supabase import create_client
 
 import config
 import b_track_config as btc
 from b_track_collector import get_yt
+from b_track_config import _read_pages, _safe_error
 from b_track_quota import QuotaGuard, QuotaExceeded
-
-_vertex_initialized = False
-
-
-def _init_vertex():
-    global _vertex_initialized
-    if not _vertex_initialized:
-        vertexai.init(project=config.GOOGLE_CLOUD_PROJECT, location=config.GOOGLE_CLOUD_LOCATION)
-        _vertex_initialized = True
 
 
 def get_db():
@@ -50,10 +40,10 @@ def _atrack_channel_ids() -> set:
 def _existing_exclusions(db) -> set:
     """이미 시드거나 이미 후보로 점수화된 채널 — 재발굴 제외"""
     excl = set()
-    seeds = db.table('trend_sources').select('source_ref').execute()
-    excl.update(s['source_ref'] for s in seeds.data)
-    cands = db.table('trend_source_candidates').select('channel_id').execute()
-    excl.update(c['channel_id'] for c in cands.data)
+    seeds = _read_pages(db.table('trend_sources').select('source_ref').order('id'))
+    excl.update(s['source_ref'] for s in seeds)
+    cands = _read_pages(db.table('trend_source_candidates').select('channel_id').order('channel_id'))
+    excl.update(c['channel_id'] for c in cands)
     return excl
 
 
@@ -63,11 +53,12 @@ def _existing_exclusions(db) -> set:
 def stage0_db_internal(db, exclude: set) -> dict:
     """trend_videos에 등장하지만 시드/후보가 아닌 채널.
     반환: {channel_id: {'channel_title':.., 'paths':['stage0']}}"""
-    rows = db.table('trend_videos').select('channel_id,channel_title').execute()
+    rows = _read_pages(db.table('trend_videos').select('channel_id,channel_title').order('video_id'))
+    atrack = _atrack_channel_ids()
     found = {}
-    for r in rows.data:
+    for r in rows:
         cid = r['channel_id']
-        if cid in exclude or cid in _atrack_channel_ids():
+        if cid in exclude or cid in atrack:
             continue
         if cid not in found:
             found[cid] = {'channel_title': r.get('channel_title', ''), 'paths': ['stage0']}
@@ -103,7 +94,7 @@ def stage1_search(guard: QuotaGuard, exclude: set, found: dict) -> dict:
                 relevanceLanguage=btc.DISCOVERY_RELEVANCE_LANG,
             ).execute()
         except Exception as e:
-            print(f"  단계1: '{kw}' search 실패: {e}")
+            print(f"  단계1: '{kw}' search 실패: {_safe_error(e)}")
             continue
 
         searched += 1
@@ -152,7 +143,7 @@ def stage2_fetch_facts(guard: QuotaGuard, found: dict) -> dict:
             print("  단계2: 예산 초과 — 중단")
             break
         except Exception as e:
-            print(f"  단계2: channels.list 실패: {e}")
+            print(f"  단계2: channels.list 실패: {_safe_error(e)}")
             continue
 
         for ch in resp.get('items', []):
@@ -195,7 +186,8 @@ def stage2_fetch_facts(guard: QuotaGuard, found: dict) -> dict:
         except QuotaExceeded:
             print("  단계2: 제목수집 중 예산 초과 — 나머지 생략")
             break
-        except Exception:
+        except Exception as e:
+            print(f"  단계2: 최근 영상 제목 수집 실패: {_safe_error(e)}")
             continue
 
     print(f"  단계2 완료 ({guard.report()})")
@@ -248,8 +240,12 @@ def _extract_json_list(text: str) -> list:
 
 def stage3_classify(facts: dict) -> dict:
     """Gemini로 채널별 분류/점수. facts에 분류결과 병합."""
-    _init_vertex()
-    model = GenerativeModel(btc.BROAD_SCAN_MODEL)
+    try:
+        import gemini_analyzer as ga
+        generate_text = ga.genai_generate_text
+    except (ImportError, AttributeError) as e:
+        print(f"  단계3: Gemini 초기화 실패: {_safe_error(e)}")
+        return facts
     ids = list(facts.keys())
     batch_size = btc.DISCOVERY_GEMINI_BATCH
 
@@ -266,20 +262,23 @@ def stage3_classify(facts: dict) -> dict:
         prompt = CLASSIFY_PROMPT.format(channels_block='\n'.join(block_lines))
 
         try:
-            resp = model.generate_content(prompt)
-            results = _extract_json_list(resp.text)
+            results = _extract_json_list(generate_text(prompt))
+            if not isinstance(results, list):
+                raise ValueError("채널 분류 응답은 JSON 객체 배열이어야 합니다")
+            for r in results:
+                cid = r.get('channel_id')
+                if cid in batch_ids:
+                    facts[cid].update({
+                        'primary_category': r.get('primary_category', 'other'),
+                        'seed_fitness_score': float(r.get('seed_fitness_score', 0)),
+                        'gender_scope': r.get('gender_scope', 'unisex'),
+                        'is_vlog_jumble': bool(r.get('is_vlog_jumble', False)),
+                        'gemini_reason': r.get('reason', ''),
+                    })
         except Exception as e:
-            print(f"  단계3: Gemini 배치 {i//batch_size+1} 실패: {e}")
+            print(f"  단계3: Gemini 배치 {i//batch_size+1} 실패: {_safe_error(e)}")
             continue
 
-        for r in results:
-            cid = r.get('channel_id')
-            if cid in facts:
-                facts[cid]['primary_category'] = r.get('primary_category', 'other')
-                facts[cid]['seed_fitness_score'] = float(r.get('seed_fitness_score', 0))
-                facts[cid]['gender_scope'] = r.get('gender_scope', 'unisex')
-                facts[cid]['is_vlog_jumble'] = bool(r.get('is_vlog_jumble', False))
-                facts[cid]['gemini_reason'] = r.get('reason', '')
         print(f"  단계3: Gemini 분류 배치 {i//batch_size+1} ({len(batch_ids)}개)")
         time.sleep(1)
 
@@ -361,7 +360,7 @@ def run_discovery():
     try:
         found = stage1_search(guard, exclude, found)
     except QuotaExceeded as e:
-        print(f"  단계1 예산 중단: {e}")
+        print(f"  단계1 예산 중단: {_safe_error(e)}")
 
     if not found:
         print("  발굴 후보 없음 — 종료")
