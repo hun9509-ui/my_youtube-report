@@ -34,16 +34,25 @@ TARGET_CHANNELS = {
     "밉지않은 관종언니": "UCtkRVaUSpkuhqdKv39oBXKA",
     "A급 장영란": "UCfVWxOKzPwSZkEcxXmrH6yw",
     "공부왕찐천재 홍진경": "UCkxbPwdaV74Erdxt97Nt23w",
-    "개과천선 서인영": "UCAMGWbOnDd9dpAK7BO0Wftw"
+    "개과천선 서인영": "UCAMGWbOnDd9dpAK7BO0Wftw",
+    "김나영의 nofilterTV": "UC0wNauoCVIfU_xtWwrczFiA",
+    "순풍 선우용여": "UCjJhHk-vpe59lCR5f4YalTQ",
+    "채정안TV": "UCktGIKibxR7agzlF62Mbx2A",
+    "신애라이프": "UCnnJ34afyg9w25I_AVZIHxA",
+    "Umaizing 엄정화TV": "UC6le2DAXq9bLVVYl6nenbEg",
+    "황신혜의 cine style": "UCrQ-eA1UWgv0TJBkbO-y13Q",
 }
 
-# ===== 초기 수집 배치 분할 (가나다순) =====
+# ===== 초기 수집 배치 분할 =====
 INITIAL_BATCHES = {
     1: ["개과천선 서인영", "고소영"],
     2: ["깡주은", "공부왕찐천재 홍진경"],
     3: ["밉지않은 관종언니", "안녕하세요 최화정이에요"],
     4: ["이민정 MJ", "A급 장영란"],
     5: ["자유부인 한가인", "한지혜 Han Ji Hye"],
+    6: ["김나영의 nofilterTV", "순풍 선우용여"],
+    7: ["채정안TV", "신애라이프"],
+    8: ["Umaizing 엄정화TV", "황신혜의 cine style"],
 }
 
 # ===== 자체 채널 =====
@@ -53,7 +62,7 @@ OWN_CHANNEL_TRACKING_WEEKS = 5  # 업로드 후 5주 월요일까지 추적
 
 # ===== 분석 버전 =====
 ANALYSIS_VERSION = "1.2"  # 검증된 응답 및 모델 버전 기록
-SCORE_VERSION = "v1.2"    # 전략 스코어링 버전
+SCORE_VERSION = "v2.0"    # 전략 스코어링 버전
 
 # ===== 분석 설정 =====
 INITIAL_MONTHS = 6
@@ -85,7 +94,7 @@ def get_gemini_fallback_models(mode='daily') -> list[str]:
     elif mode in ('btrack', 'free'):
         models = ["gemini-2.5-flash-lite"]
     else:
-        models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+        models = ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
     primary = get_gemini_model(mode)
     return [model for model in dict.fromkeys(models) if model and model != primary]
 

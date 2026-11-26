@@ -33,6 +33,45 @@ def video(video_id, days=0):
     }
 
 
+class ConfigTests(unittest.TestCase):
+    def test_competitor_channel_ids(self):
+        channel_ids = config.TARGET_CHANNELS.values()
+        self.assertEqual(len(channel_ids), 16)
+        self.assertEqual(len(set(channel_ids)), len(channel_ids))
+        self.assertTrue(all(channel_id.startswith("UC") for channel_id in channel_ids))
+
+        expected_channels = {
+            "안녕하세요 최화정이에요": "UCA9kvKQdNxslWm5IKZgXS_A",
+            "한지혜 Han Ji Hye": "UCfcEEsjr6_lUUHQ-1zID2cQ",
+            "김나영의 nofilterTV": "UC0wNauoCVIfU_xtWwrczFiA",
+            "순풍 선우용여": "UCjJhHk-vpe59lCR5f4YalTQ",
+            "채정안TV": "UCktGIKibxR7agzlF62Mbx2A",
+            "신애라이프": "UCnnJ34afyg9w25I_AVZIHxA",
+            "Umaizing 엄정화TV": "UC6le2DAXq9bLVVYl6nenbEg",
+            "황신혜의 cine style": "UCrQ-eA1UWgv0TJBkbO-y13Q",
+        }
+        for channel, expected_id in expected_channels.items():
+            with self.subTest(channel=channel):
+                self.assertEqual(config.TARGET_CHANNELS[channel], expected_id)
+
+    def test_initial_batches_cover_all_competitors_once(self):
+        self.assertEqual(set(config.INITIAL_BATCHES), set(range(1, 9)))
+        channels = [channel for batch in config.INITIAL_BATCHES.values() for channel in batch]
+        self.assertCountEqual(channels, config.TARGET_CHANNELS.keys())
+
+    def test_score_version(self):
+        self.assertEqual(config.SCORE_VERSION, "v2.0")
+
+    def test_default_daily_gemini_fallback_order(self):
+        with patch.dict("os.environ", clear=True):
+            self.assertEqual(config.get_gemini_fallback_models("daily"), [
+                "gemini-3.5-flash-lite",
+                "gemini-2.5-flash-lite",
+                "gemini-3.8-flash",
+                "gemini-3.5-flash",
+            ])
+
+
 class TrendTests(unittest.TestCase):
     def test_failed_categories_do_not_publish_empty_results(self):
         with patch.object(config, "TRENDING_CATEGORIES", {"A": "1"}), \
@@ -461,10 +500,6 @@ class ProcessingKeyFallbackTests(unittest.TestCase):
                 patch.object(db.session, "request", side_effect=http.request), \
                 patch.object(supabase_writer, "get_client", return_value=db):
             yield requests
-
-    def test_competitor_channel_ids(self):
-        self.assertEqual(config.TARGET_CHANNELS["안녕하세요 최화정이에요"], "UCA9kvKQdNxslWm5IKZgXS_A")
-        self.assertEqual(config.TARGET_CHANNELS["한지혜 Han Ji Hye"], "UCfcEEsjr6_lUUHQ-1zID2cQ")
 
     def test_daily_state_retries_without_processing_key(self):
         error = (400, {"code": "42703", "message": "column daily_analysis.processing_key does not exist"})
