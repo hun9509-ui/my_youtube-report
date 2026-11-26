@@ -6,6 +6,7 @@
 API 호출 없음. 결정론적.
 """
 import config
+from gemini_client import safe_error
 
 
 def _clamp(v, lo: int = 0, hi: int = 100) -> int:
@@ -293,5 +294,5 @@ def score_batch(videos_map: dict, analyses: list, source_table: str) -> list:
         try:
             results.append(score_video(video, a, source_table))
         except Exception as e:
-            print(f"  ⚠️ 스코어링 실패 ({vid}): {e}")
+            print(f"  ⚠️ 스코어링 실패 ({vid}): {safe_error(e)}")
     return results

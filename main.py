@@ -13,6 +13,8 @@
   python main.py score-backfill       : 전략 스코어 미산출분 처리
   python main.py snapshot-collect     : 전체 영상 시계열 스냅샷 수집 (매일)
   python main.py growth-pattern       : 성장 패턴 분류 업데이트
+  python main.py repair-data          : 분석 데이터 점검 및 수리
+  python main.py pattern-report       : 패턴 리포트
 """
 import sys
 import time
@@ -31,6 +33,12 @@ import trend_classifier as tc
 import strategy_scorer as scorer
 
 def validate_env(mode):
+    if mode in {"repair-data", "pattern-report"}:
+        missing = [key for key in ("SUPABASE_URL", "SUPABASE_KEY") if not getattr(config, key)]
+        if missing:
+            print(f"❌ 누락된 환경변수: {', '.join(missing)}")
+        return not missing
+
     if config.GEMINI_PROVIDER not in {"ai_studio", "vertexai"}:
         print("❌ GEMINI_PROVIDER는 ai_studio 또는 vertexai이어야 합니다")
         return False
@@ -1533,6 +1541,12 @@ if __name__ == "__main__":
         run_history_extend(extra_months=months)
     elif mode == "comment-backfill":
         run_comment_backfill()
+    elif mode == "repair-data":
+        import repair_analysis
+        sys.exit(repair_analysis.main(sys.argv[2:]))
+    elif mode == "pattern-report":
+        import pattern_learner
+        sys.exit(pattern_learner.main(sys.argv[2:]))
     elif mode in {
         "b-track-init", "b-track-collect", "b-track-scan", "b-track-cluster",
         "b-track-score", "b-track-discover", "b-track-run",

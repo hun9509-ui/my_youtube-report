@@ -212,10 +212,14 @@ def run_broad_scan(max_videos: int = None):
             # 영상 1개의 멘션을 모아 한 번에 upsert (on_conflict=DO NOTHING). 왕복 대폭 감소.
             mention_rows = []
             seen_eids = set()
-            for ent in item.get('entities', []):
-                name = ent.get('name', '').strip()
-                etype = ent.get('entity_type', 'item')
-                category = ent.get('category', 'lifestyle')
+            raw_entities = item.get('entities')
+            entities = raw_entities if isinstance(raw_entities, list) else []
+            for ent in entities:
+                if not isinstance(ent, dict):
+                    continue
+                name = str(ent.get('name') or '').strip()
+                etype = str(ent.get('entity_type') or 'item').strip() or 'item'
+                category = str(ent.get('category') or 'lifestyle').strip() or 'lifestyle'
                 raw_confidence = ent.get('confidence')
                 try:
                     confidence = float(raw_confidence if raw_confidence is not None else 0.8)
