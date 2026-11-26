@@ -22,6 +22,25 @@ def _read_pages(build_query, page_size=500):
         offset += len(page)
 
 
+def _is_missing_processing_key_error(exc: Exception) -> bool:
+    error = " ".join(str(part) for part in (
+        exc, getattr(exc, "code", ""), getattr(exc, "message", ""),
+        getattr(exc, "details", ""), getattr(exc, "args", ()),
+    )).lower()
+    return "processing_key" in error and any(
+        marker in error for marker in ("42703", "pgrst204", "does not exist", "could not find")
+    )
+
+
+def _save_legacy_dated_row(client, table, date_column, payload):
+    existing = (client.table(table).select("id")
+                .eq(date_column, payload[date_column]).order("id", desc=True)
+                .limit(1).execute().data)
+    if existing:
+        return client.table(table).update(payload).eq("id", existing[0]["id"]).execute()
+    return client.table(table).insert(payload).execute()
+
+
 def get_client() -> Client:
     """Supabase 클라이언트 (지연 초기화)"""
     global _client
@@ -154,11 +173,23 @@ def get_daily_state(video_ids):
     if not client:
         raise RuntimeError("Supabase 연결 설정 누락")
     analyses, scored = {}, set()
+    legacy_columns = "video_id,analysis_date,gemini_raw,deepseek_raw"
+    columns = "video_id,analysis_date,processing_key,gemini_raw,deepseek_raw"
     for start in range(0, len(video_ids), 100):
         batch = video_ids[start:start + 100]
-        for row in _read_pages(lambda: client.table("daily_analysis")
-                 .select("video_id,analysis_date,processing_key,gemini_raw,deepseek_raw")
-                 .in_("video_id", batch).order("id", desc=True)):
+
+        def build_query():
+            return (client.table("daily_analysis").select(columns)
+                    .in_("video_id", batch).order("id", desc=True))
+
+        try:
+            rows = list(_read_pages(build_query))
+        except Exception as exc:
+            if not _is_missing_processing_key_error(exc):
+                raise
+            columns = legacy_columns
+            rows = _read_pages(build_query)
+        for row in rows:
             if has_text(row.get("gemini_raw"), "topic"):
                 analyses.setdefault(row["video_id"], row)
         scores = (client.table("video_scores").select("video_id")
@@ -166,6 +197,34 @@ def get_daily_state(video_ids):
                   .in_("video_id", batch).limit(100).execute().data)
         scored.update(row["video_id"] for row in scores)
     return analyses, scored
+
+
+def _save_legacy_daily_analysis(client, rows):
+    legacy_rows = {row["video_id"]: row for row in rows}
+    video_ids = list(legacy_rows)
+    existing_ids = {}
+    for start in range(0, len(video_ids), 100):
+        batch = video_ids[start:start + 100]
+        existing = _read_pages(lambda: client.table("daily_analysis")
+                               .select("id,video_id,topic,gemini_raw")
+                               .in_("video_id", batch).order("id", desc=True))
+        for row in existing:
+            if has_text(row.get("gemini_raw"), "topic") and (row.get("topic") or "").strip():
+                existing_ids.setdefault(row["video_id"], row["id"])
+
+    saved = 0
+    new_rows = []
+    for video_id, row in legacy_rows.items():
+        row.pop("processing_key")
+        if video_id in existing_ids:
+            result = (client.table("daily_analysis").update(row)
+                      .eq("id", existing_ids[video_id]).execute())
+            saved += len(result.data)
+        else:
+            new_rows.append(row)
+    if new_rows:
+        saved += len(client.table("daily_analysis").insert(new_rows).execute().data)
+    return saved
 
 
 def save_daily_analysis(analyses, analysis_date=None):
@@ -218,9 +277,16 @@ def save_daily_analysis(analyses, analysis_date=None):
     if not rows:
         return 0
     try:
-        result = client.table('daily_analysis').upsert(rows, on_conflict="processing_key").execute()
-        print(f"  💾 Supabase: daily_analysis {len(result.data)}개 저장")
-        return len(result.data)
+        try:
+            result = client.table('daily_analysis').upsert(rows, on_conflict="processing_key").execute()
+        except Exception as exc:
+            if not _is_missing_processing_key_error(exc):
+                raise
+            saved = _save_legacy_daily_analysis(client, rows)
+        else:
+            saved = len(result.data)
+        print(f"  💾 Supabase: daily_analysis {saved}개 저장")
+        return saved
     except Exception as e:
         print(f"  ⚠️ Supabase daily_analysis 저장 실패: {safe_error(e)}")
         return 0
@@ -235,19 +301,26 @@ def save_weekly_report(report: dict, report_date=None) -> bool:
         return False
     today = report_date or datetime.now(config.KST).date()
     week_start = today - timedelta(days=today.weekday())
+    payload = {
+        'report_date': today.isoformat(),
+        'processing_key': week_start.isoformat(),
+        'week_summary': report.get('week_summary', ''),
+        'top_performing_channels': report.get('top_performing_channels', []),
+        'rising_topics': report.get('rising_topics', []),
+        'format_trends': report.get('format_trends', []),
+        'ppl_observations': report.get('ppl_observations', ''),
+        'actionable_insights_for_hangoeun': report.get('actionable_insights_for_hangoeun', []),
+        'next_video_suggestions': report.get('next_video_suggestions', []),
+        'raw_data': report,
+    }
     try:
-        result = client.table('weekly_reports').upsert({
-            'report_date': today.isoformat(),
-            'processing_key': week_start.isoformat(),
-            'week_summary': report.get('week_summary', ''),
-            'top_performing_channels': report.get('top_performing_channels', []),
-            'rising_topics': report.get('rising_topics', []),
-            'format_trends': report.get('format_trends', []),
-            'ppl_observations': report.get('ppl_observations', ''),
-            'actionable_insights_for_hangoeun': report.get('actionable_insights_for_hangoeun', []),
-            'next_video_suggestions': report.get('next_video_suggestions', []),
-            'raw_data': report,
-        }, on_conflict="processing_key").execute()
+        try:
+            result = client.table('weekly_reports').upsert(payload, on_conflict="processing_key").execute()
+        except Exception as exc:
+            if not _is_missing_processing_key_error(exc):
+                raise
+            payload.pop("processing_key")
+            result = _save_legacy_dated_row(client, "weekly_reports", "report_date", payload)
         if not result.data:
             return False
         print(f"  💾 Supabase: weekly_reports 저장")
@@ -329,13 +402,35 @@ def save_trend_classified(classified: dict) -> int:
  
     saved = 0
     if rows:
-        result = client.table('trend_classified').upsert(rows, on_conflict='processing_key').execute()
-        saved = len(result.data)
+        try:
+            result = client.table('trend_classified').upsert(rows, on_conflict='processing_key').execute()
+        except Exception as exc:
+            if not _is_missing_processing_key_error(exc):
+                raise
+            existing = _read_pages(lambda: client.table("trend_classified").select("track,video_id")
+                                   .eq("analysis_date", today).order("id"))
+            existing_keys = {(row["track"], row["video_id"]) for row in existing}
+            requested = {(row["track"], row["video_id"]): row for row in rows}
+            saved = len(requested.keys() & existing_keys)
+            missing_rows = [row for key, row in requested.items() if key not in existing_keys]
+            if missing_rows:
+                for row in missing_rows:
+                    row.pop("processing_key")
+                saved += len(client.table("trend_classified").insert(missing_rows).execute().data)
+        else:
+            saved = len(result.data)
     event_kws = classified.get('event_keywords', [])
     if event_kws:
-        result = client.table('event_keywords').upsert({
+        payload = {
             'processing_key': today, 'analysis_date': today, 'keywords': event_kws,
-        }, on_conflict='processing_key').execute()
+        }
+        try:
+            result = client.table('event_keywords').upsert(payload, on_conflict='processing_key').execute()
+        except Exception as exc:
+            if not _is_missing_processing_key_error(exc):
+                raise
+            payload.pop("processing_key")
+            result = _save_legacy_dated_row(client, "event_keywords", "analysis_date", payload)
         if len(result.data) != 1:
             raise RuntimeError("트렌드 키워드 저장 건수 불일치")
     return saved

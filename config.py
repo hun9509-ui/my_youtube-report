@@ -25,12 +25,12 @@ GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
 # ===== 분석 대상 채널 =====
 TARGET_CHANNELS = {
-    "안녕하세요 최화정이에요": "UCIQQC0T_yj-pXoXRk5vaOAw",
+    "안녕하세요 최화정이에요": "UCA9kvKQdNxslWm5IKZgXS_A",
     "이민정 MJ": "UCFNUGAiaGRgzVCXrjVoe1Hw",
     "자유부인 한가인": "UCvnVUhn95YfQazC_bc2lU6w",
     "깡주은": "UCcjmCG5tTegWwqcSDSkDevQ",
     "고소영": "UCag6Qu6uHjQKPvBI5MW12AQ",
-    "한지혜 Han Ji Hye": "UC1vQa5Pbtt-uewHSxUPc8rA",
+    "한지혜 Han Ji Hye": "UCfcEEsjr6_lUUHQ-1zID2cQ",
     "밉지않은 관종언니": "UCtkRVaUSpkuhqdKv39oBXKA",
     "A급 장영란": "UCfVWxOKzPwSZkEcxXmrH6yw",
     "공부왕찐천재 홍진경": "UCkxbPwdaV74Erdxt97Nt23w",
