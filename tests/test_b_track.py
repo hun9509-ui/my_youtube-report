@@ -81,6 +81,158 @@ class BTrackScorerTest(unittest.TestCase):
         self.assertEqual(score["recommended_action"], "관찰")
         self.assertEqual(card["confidence"], "low")
 
+    def test_fashion_scores_use_recent_commerce_and_engagement(self):
+        entity = {"id": 7, "name": "샤넬", "entity_type": "item", "category": "Fashion"}
+        mentions = [
+            dict(
+                _mention("v1", "c1", 1, 1000, 500), title=None, description_short="사이즈 추천 할인",
+                view_count=2000, like_count=20, comment_count=4,
+            ),
+            dict(
+                _mention("v2", "c2", 2, 1000, 500), title="일상", view_count_at_scan=0,
+                view_count=1000, like_count=0, comment_count=8,
+            ),
+            dict(
+                _mention("v3", "c3", 4, 1000, 500), title="일상", view_count_at_scan=None,
+                like_count=500, comment_count=500,
+            ),
+            dict(_mention("old", "c4", 50, 1000, 100), like_count=500, comment_count=500),
+        ]
+
+        score, card = score_entity(entity, mentions)
+
+        expected = {
+            "engagement_score": 0.467,
+            "commerce_signal": 0.5,
+            "item_heat_score": 0.694,
+            "shopping_intent_score": 0.5,
+            "ppl_potential": 0.7,
+            "channel_fit_score": 0.95,
+            "production_difficulty": 0.6,
+            "originality_room": 0.85,
+        }
+        for metric, value in expected.items():
+            with self.subTest(metric=metric):
+                self.assertGreater(score[metric], 0.0)
+                self.assertLessEqual(score[metric], 1.0)
+                self.assertEqual(score[metric], value)
+        self.assertEqual(len(card["evidence_bullets"]), 4)
+        self.assertEqual(
+            card["evidence_bullets"][-1], "주력 포맷 review | 커머스 신호 0.50 | 참여율 0.47",
+        )
+
+        for no_recent_mentions in ([], mentions[-1:]):
+            empty_score, _ = score_entity(entity, no_recent_mentions)
+            for metric in expected:
+                with self.subTest(metric=metric, mentions=len(no_recent_mentions)):
+                    self.assertEqual(empty_score[metric], 0.0)
+
+        missing = dict(_mention("missing", "c1", 1, 1000, 500), title="일상")
+        zeros = dict(missing, video_id="zeros", like_count=0, comment_count=0)
+        no_engagement, _ = score_entity(entity, [missing, zeros])
+        self.assertEqual(no_engagement["engagement_score"], 0.0)
+        self.assertEqual(no_engagement["shopping_intent_score"], 0.0)
+
+    def test_classify_format_uses_explicit_values_then_ordered_keywords(self):
+        cases = [
+            ({"title": "OOTD 코디 추천"}, "lookbook"),
+            ({"title": "셔츠 입는 법", "description_short": "쇼핑 후기"}, "styling"),
+            ({"title": "내돈내산 추천 리뷰"}, "haul"),
+            ({"title": "일상", "description_short": "가성비 비교 후기"}, "buying_guide"),
+            ({"title": "솔직 착용 후기", "video_type": "shorts"}, "review"),
+            ({"description_short": "아침 GRWM"}, "routine"),
+            ({"title": "일상", "video_type": "Shorts"}, "shorts_tip"),
+            ({"title": "일상", "video_type": "long"}, "vlog"),
+            ({"title": "룩북", "content_format": "review", "format": "haul"}, "review"),
+            ({"title": "룩북", "content_format": "unknown", "format": "vlog"}, "vlog"),
+        ]
+        for mention, expected in cases:
+            with self.subTest(mention=mention):
+                self.assertEqual(scorer.classify_format(mention), expected)
+
+    def test_canonical_entity_key_normalizes_aliases(self):
+        aliases = [
+            ("NIKE", "나이키"),
+            (" New-Balance ", "뉴발란스"),
+            ("Arc'teryx", "아크테릭스"),
+            ("Ralph_Lauren", "폴로"),
+            ("OLIVE.YOUNG", "올영"),
+            ("H & M", "에이치앤엠"),
+            ("Local.Brand'", "localbrand"),
+            (" - _ . & ' ", ""),
+        ]
+        for name, alias in aliases:
+            with self.subTest(name=name):
+                self.assertEqual(scorer.canonical_entity_key(name), scorer.canonical_entity_key(alias))
+        self.assertEqual(scorer.canonical_entity_key(" Local.Brand' "), "localbrand")
+
+    def test_run_score_merges_aliases_and_deduplicates_video_mentions(self):
+        entities = [
+            {"id": 1, "name": "Nike", "entity_type": "brand", "category": "fashion"},
+            {"id": 2, "name": "나이키", "entity_type": "brand", "category": "fashion"},
+        ]
+        mentions = [
+            dict(_mention("shared", "c1", 1, 1000, 500), entity_id=1, confidence=0.9),
+            dict(_mention("v2", "c2", 1, 1000, 500), entity_id=1),
+            dict(_mention("shared", "c1", 1, 3000, 1500), entity_id=2, confidence=0.8),
+            dict(_mention("v3", "c3", 1, 1000, 500), entity_id=2),
+            dict(_mention("v4", "c4", 1, 1000, 500), entity_id=2),
+        ]
+        for rows, channels, shared_confidence in ((mentions, 4, 0.8), (mentions[:-1], 3, 0.9)):
+            with self.subTest(channels=channels):
+                rows = [
+                    dict(row, confidence=shared_confidence)
+                    if row["entity_id"] == 2 and row["video_id"] == "shared" else row
+                    for row in rows
+                ]
+                tables = {name: Mock() for name in (
+                    "trend_entities", "entity_mentions", "trend_videos", "trend_entity_scores", "trend_answer_cards",
+                )}
+                db = Mock()
+                db.table.side_effect = tables.__getitem__
+                tables["trend_entities"].select.return_value = _select_rows(entities)
+                tables["entity_mentions"].select.return_value = _select_rows(rows)
+                tables["trend_videos"].select.return_value = _select_rows([])
+
+                with patch.object(scorer, "_db", return_value=db), redirect_stdout(StringIO()):
+                    self.assertEqual(scorer.run_score(), 1)
+
+                score, = tables["trend_entity_scores"].upsert.call_args.args[0]
+                card, = tables["trend_answer_cards"].upsert.call_args.args[0]
+                self.assertEqual(score["entity_name"], "나이키")
+                self.assertEqual(score["entity_id"], 2)
+                self.assertEqual(card["entity_id"], 2)
+                self.assertEqual(score["mention_count_30d"], channels)
+                self.assertEqual(score["distinct_channels_30d"], channels)
+                expected_shared_views = 1000 if shared_confidence < 0.9 else 3000
+                self.assertEqual(score["total_views_30d"], (channels - 1) * 1000 + expected_shared_views)
+                tables["trend_entities"].upsert.assert_not_called()
+                tables["trend_entities"].update.assert_not_called()
+
+    def test_load_mentions_merges_video_metrics_and_defaults(self):
+        tables = {name: Mock() for name in ("entity_mentions", "trend_videos")}
+        db = Mock()
+        db.table.side_effect = tables.__getitem__
+        tables["entity_mentions"].select.return_value = _select_rows([
+            {"entity_id": 1, "video_id": "short"},
+            {"entity_id": 1, "video_id": "missing"},
+        ])
+        tables["trend_videos"].select.return_value = _select_rows([{
+            "video_id": "short", "title": "일상", "video_type": "shorts", "view_count": 1000,
+            "like_count": 40, "comment_count": None, "duration_seconds": 20, "description_short": "오늘",
+        }])
+
+        short, missing = scorer._load_mentions_for_entities(db, [1])[1]
+
+        tables["trend_videos"].select.assert_called_once_with(
+            "video_id,title,channel_title,view_count,like_count,comment_count,duration_seconds,"
+            "description_short,view_over_baseline,video_type"
+        )
+        self.assertEqual(scorer.classify_format(short), "shorts_tip")
+        fields = ("like_count", "comment_count", "duration_seconds", "description_short")
+        self.assertEqual(tuple(short[key] for key in fields), (40, 0, 20, "오늘"))
+        self.assertEqual(tuple(missing[key] for key in fields), (0, 0, 0, ""))
+
     def test_mentions_are_scored_across_pages(self):
         db = Mock()
         tables = {name: Mock() for name in ("entity_mentions", "trend_videos")}
