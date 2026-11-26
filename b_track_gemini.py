@@ -144,6 +144,7 @@ def run_broad_scan(max_videos: int = None):
 
     total_entities = 0
     processed = 0
+    failed_batches = 0
 
     for batch_start in range(0, len(videos), batch_size):
         batch = videos[batch_start:batch_start + batch_size]
@@ -185,6 +186,7 @@ def run_broad_scan(max_videos: int = None):
                     text = ga.genai_generate_text(prompt, model_name=used_model)
                 results = _extract_json_list(text)
         except Exception as e:
+            failed_batches += 1
             error = _safe_error(e)
             print(f"  ❌ 배치 {batch_start//batch_size + 1} Gemini 오류: {error}")
             if job_id:
@@ -198,15 +200,15 @@ def run_broad_scan(max_videos: int = None):
 
         # 결과 파싱 및 저장
         batch_entities = 0
-        video_id_set = {v['video_id'] for v in batch}
+        succeeded_video_ids = []
         video_meta = {v['video_id']: v for v in batch}
 
         for item in results:
             vid = item.get('video_id')
-            if vid not in video_id_set:
+            vmeta = video_meta.pop(vid, None)
+            if vmeta is None:
                 continue
 
-            vmeta = video_meta[vid]
             # 영상 1개의 멘션을 모아 한 번에 upsert (on_conflict=DO NOTHING). 왕복 대폭 감소.
             mention_rows = []
             seen_eids = set()
@@ -214,7 +216,11 @@ def run_broad_scan(max_videos: int = None):
                 name = ent.get('name', '').strip()
                 etype = ent.get('entity_type', 'item')
                 category = ent.get('category', 'lifestyle')
-                confidence = float(ent.get('confidence', 0.8))
+                raw_confidence = ent.get('confidence')
+                try:
+                    confidence = float(raw_confidence if raw_confidence is not None else 0.8)
+                except (TypeError, ValueError):
+                    confidence = 0.8
 
                 if not name or confidence < 0.5:
                     continue
@@ -230,45 +236,53 @@ def run_broad_scan(max_videos: int = None):
                     'channel_id': vmeta['channel_id'],
                     'mentioned_in': 'title',
                     'confidence': confidence,
-                    'view_count_at_scan': vmeta['view_count'],
+                    'view_count_at_scan': int(vmeta.get('view_count') or 0),
                     'published_at': vmeta['published_at'],
                 })
 
-            if not mention_rows:
-                continue
             # 영상 단위 격리: 한 영상 실패해도 나머지 배치는 계속
-            try:
-                db.table('entity_mentions').upsert(
-                    mention_rows,
-                    on_conflict='entity_id,video_id',
-                    ignore_duplicates=True,
-                ).execute()
+            if mention_rows:
+                try:
+                    db.table('entity_mentions').upsert(
+                        mention_rows,
+                        on_conflict='entity_id,video_id',
+                        ignore_duplicates=True,
+                    ).execute()
+                except Exception as me:
+                    print(f"    ⚠️ mention skip (vid={vid}): {_safe_error(me)[:80]}")
+                    continue
                 batch_entities += len(mention_rows)
-            except Exception as me:
-                print(f"    ⚠️ mention skip (vid={vid}): {_safe_error(me)[:80]}")
-                continue
+            succeeded_video_ids.append(vid)
 
-        # broad_scan_done 업데이트
-        scan_video_ids = [v['video_id'] for v in batch]
-        db.table('trend_videos').update({
-            'broad_scan_done': True,
-            'broad_scan_at': datetime.now(timezone.utc).isoformat(),
-        }).in_('video_id', scan_video_ids).execute()
+        completed = len(succeeded_video_ids)
+        if completed:
+            db.table('trend_videos').update({
+                'broad_scan_done': True,
+                'broad_scan_at': datetime.now(timezone.utc).isoformat(),
+            }).in_('video_id', succeeded_video_ids).execute()
+        else:
+            failed_batches += 1
 
         # job 완료 기록
         if job_id:
-            db.table('gemini_jobs').update({
-                'status': 'done',
+            job_result = {
+                'status': 'done' if completed else 'failed',
                 'model': used_model,
                 'finished_at': datetime.now(timezone.utc).isoformat(),
                 'estimated_cost_usd': round(len(batch) * 0.00005, 6),
-            }).eq('id', job_id).execute()
+            }
+            if not completed:
+                job_result['error_summary'] = '완료된 영상 없음'
+            db.table('gemini_jobs').update(job_result).eq('id', job_id).execute()
 
         total_entities += batch_entities
-        processed += len(batch)
-        print(f"  배치 {batch_start//batch_size + 1}: {len(batch)}영상 → 엔티티 {batch_entities}개")
+        processed += completed
+        print(f"  배치 {batch_start//batch_size + 1}: {completed}/{len(batch)}영상 완료 → 엔티티 {batch_entities}개")
 
         time.sleep(1)  # rate limit 방지
+
+    if failed_batches > 0 and processed == 0:
+        raise RuntimeError(f"B-track 브로드 스캔 실패: {failed_batches}배치에서 완료된 영상 없음")
 
     print(f"\n✅ 브로드 스캔 완료: {processed}영상 처리, 엔티티 {total_entities}개 추출")
     return processed
@@ -296,7 +310,7 @@ def run_cluster():
     for m in mentions:
         eid = m['entity_id']
         agg[eid]['channels'].add(m['channel_id'])
-        agg[eid]['views'] += m.get('view_count_at_scan', 0)
+        agg[eid]['views'] += int(m.get('view_count_at_scan') or 0)
         agg[eid]['count'] += 1
 
     # 상위 엔티티 → 클러스터 갱신

@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -158,15 +159,26 @@ def _select_rows(rows):
 
 
 class BTrackPaginationTest(unittest.TestCase):
-    def test_postgrest_does_not_repeat_range_parameters_on_later_pages(self):
+    def test_scorer_postgrest_request_filters_recent_mentions_across_pages(self):
         base_url = "https://example.invalid"
-        rows = [{"id": i} for i in range(1001)]
+        created_at = datetime.now(timezone.utc) - timedelta(days=1)
+        rows = [{
+            "entity_id": 7, "video_id": f"v{i}", "channel_id": "example",
+            "published_at": None, "created_at": created_at.isoformat(),
+        } for i in range(1001)]
         offsets = []
+        oldest_allowed = datetime.now(timezone.utc) - timedelta(days=scorer.WINDOW_90D + 1)
+        filters = []
 
         def respond(request):
+            if request.url.path == "/trend_videos":
+                return httpx.Response(200, json=[])
+            self.assertEqual(request.url.path, "/entity_mentions")
             params = request.url.params
             self.assertEqual(params.get_list("limit"), ["1000"])
             self.assertEqual(len(params.get_list("offset")), 1)
+            self.assertEqual(params.get_list("entity_id"), ["in.(7)"])
+            filters.append(params.get_list("or"))
             offset = int(params["offset"])
             offsets.append(offset)
             return httpx.Response(200, json=rows[offset:offset + 1000])
@@ -174,9 +186,18 @@ class BTrackPaginationTest(unittest.TestCase):
         with SyncPostgrestClient(base_url) as db, \
                 httpx.Client(base_url=base_url, transport=httpx.MockTransport(respond)) as http, \
                 patch.object(db.session, "request", side_effect=http.request):
-            self.assertEqual(btc._read_pages(lambda: db.from_("example").select("id").order("id")), rows)
+            mentions = scorer._load_mentions_for_entities(db, [7])[7]
 
         self.assertEqual(offsets, [0, 1000])
+        cutoff = filters[0][0].split(",", 1)[0].removeprefix("(published_at.gte.")
+        expected = f"(published_at.gte.{cutoff},and(published_at.is.null,created_at.gte.{cutoff}))"
+        self.assertEqual(filters, [[expected], [expected]])
+        latest_allowed = datetime.now(timezone.utc) - timedelta(days=scorer.WINDOW_90D + 1)
+        self.assertLessEqual(oldest_allowed, datetime.fromisoformat(cutoff))
+        self.assertLessEqual(datetime.fromisoformat(cutoff), latest_allowed)
+        score, _ = score_entity({"id": 7}, mentions)
+        self.assertEqual(score["mention_count_7d"], 1001)
+        self.assertEqual(score["mention_count_90d"], 1001)
 
 
 class BTrackCollectorTest(unittest.TestCase):
@@ -233,11 +254,38 @@ class BTrackCollectorTest(unittest.TestCase):
             uri=f"https://example.invalid/youtube?part=snippet&key={fake_key}&maxResults=50",
         )
 
-        self.assertEqual(collector.run_collect(), 0)
+        with self.assertRaisesRegex(RuntimeError, "1채널 전부 실패"):
+            collector.run_collect()
         self.assertIn("수집 실패, 스킵", self.output.getvalue())
         self.assertIn("&key=[redacted]&maxResults=50", self.output.getvalue())
         self.assertNotIn(fake_key, self.output.getvalue())
         self.videos.update.assert_not_called()
+
+    def test_quota_stop_after_failure_does_not_fail_collection(self):
+        self.sources.select.side_effect = [
+            _select_rows([
+                {"id": 1, "source_ref": "a", "source_name": "A"},
+                {"id": 2, "source_ref": "b", "source_name": "B"},
+            ]),
+            _select_rows([]),
+        ]
+        self.collect.side_effect = [RuntimeError("unavailable"), collector.QuotaExceeded("quota")]
+
+        self.assertEqual(collector.run_collect(), 0)
+        self.assertIn("예산소진 중단", self.output.getvalue())
+
+    def test_empty_success_prevents_total_failure(self):
+        self.sources.select.side_effect = [
+            _select_rows([
+                {"id": 1, "source_ref": "a", "source_name": "A"},
+                {"id": 2, "source_ref": "b", "source_name": "B"},
+            ]),
+            _select_rows([]),
+        ]
+        self.collect.side_effect = [RuntimeError("unavailable"), []]
+
+        self.assertEqual(collector.run_collect(), 0)
+        self.assertIn("성공 1채널 / 실패 1채널", self.output.getvalue())
 
     def test_masks_query_and_configured_keys_without_shared_formatter(self):
         fake_key = "configured-test-value"
@@ -265,7 +313,7 @@ class BTrackGeminiTest(unittest.TestCase):
             "entity_mentions": mentions, "trend_entities": entities, "trend_clusters": clusters,
         }.__getitem__
         mentions.select.return_value = _select_rows([
-            {"entity_id": 1700, "channel_id": f"c{i % 4}", "view_count_at_scan": 3}
+            {"entity_id": 1700, "channel_id": f"c{i % 4}", "view_count_at_scan": 3 if i else None}
             for i in range(1001)
         ])
         entities.select.return_value = _select_rows([
@@ -282,16 +330,19 @@ class BTrackGeminiTest(unittest.TestCase):
         cluster = clusters.update.call_args.args[0]
         self.assertEqual(cluster["mention_count_7d"], 1001)
         self.assertEqual(cluster["distinct_channels_7d"], 4)
-        self.assertEqual(cluster["total_views_7d"], 3003)
+        self.assertEqual(cluster["total_views_7d"], 3000)
         clusters.update.return_value.eq.assert_called_once_with("id", 4)
 
-    def _scan_tables(self):
+    def _scan_tables(self, *video_ids):
         videos, jobs = Mock(), Mock()
-        self.db.table.side_effect = {"trend_videos": videos, "gemini_jobs": jobs}.__getitem__
+        mentions = Mock()
+        self.db.table.side_effect = {
+            "trend_videos": videos, "gemini_jobs": jobs, "entity_mentions": mentions,
+        }.__getitem__
         videos.select.return_value = _select_rows([{
-            "video_id": "v1", "channel_id": "c1", "channel_title": "Channel",
-            "title": "Video", "description_short": "",
-        }])
+            "video_id": vid, "channel_id": "c1", "channel_title": "Channel",
+            "title": "Video", "description_short": "", "view_count": None, "published_at": None,
+        } for vid in video_ids or ("v1",)])
         jobs.insert.return_value.execute.return_value = SimpleNamespace(data=[{"id": 9}])
         return videos, jobs
 
@@ -331,12 +382,14 @@ class BTrackGeminiTest(unittest.TestCase):
         self.assertEqual(jobs.update.call_args.args[0]["model"], "served-deepseek-model")
 
     def test_broad_scan_masks_failed_job_summary_and_leaves_video_pending(self):
-        videos, jobs = self._scan_tables()
+        videos, jobs = self._scan_tables("v1", "v2")
         fake_key = "SECRET_KEY"
         with patch.object(gemini.ds, "call_deepseek_raw", return_value="", create=True), \
+                patch.object(btc, "BROAD_SCAN_BATCH_SIZE", 1), \
                 patch.object(gemini.ga, "genai_generate_text_with_meta", create=True,
                              side_effect=RuntimeError(f"https://example.invalid?key={fake_key}")):
-            self.assertEqual(gemini.run_broad_scan(), 0)
+            with self.assertRaisesRegex(RuntimeError, "2배치에서 완료된 영상 없음"):
+                gemini.run_broad_scan()
 
         failed = jobs.update.call_args.args[0]
         self.assertEqual(failed["status"], "failed")
@@ -345,8 +398,73 @@ class BTrackGeminiTest(unittest.TestCase):
         self.assertNotIn(fake_key, self.output.getvalue())
         videos.update.assert_not_called()
 
+    def test_broad_scan_finishes_only_reported_videos_with_successful_writes(self):
+        videos, _ = self._scan_tables("written", "failed", "missing", "empty")
+        mentions = self.db.table("entity_mentions")
+        mentions.upsert.return_value.execute.side_effect = [None, RuntimeError("DB write failed")]
+        response = json.dumps([
+            {"video_id": "written", "entities": [
+                {"name": "Brand A", "confidence": None},
+                {"name": "Brand B", "confidence": "bad"},
+            ]},
+            {"video_id": "failed", "entities": [{"name": "Brand A"}]},
+            {"video_id": "empty", "entities": []},
+        ])
+        with patch.object(gemini.ds, "call_deepseek_raw", return_value=response, create=True), \
+                patch.object(gemini, "_upsert_entity", side_effect=[1, 2, 1]):
+            self.assertEqual(gemini.run_broad_scan(), 2)
+
+        videos.update.return_value.in_.assert_called_once_with("video_id", ["written", "empty"])
+        self.assertTrue(videos.update.call_args.args[0]["broad_scan_done"])
+        written = mentions.upsert.call_args_list[0].args[0]
+        self.assertEqual([(row["confidence"], row["view_count_at_scan"]) for row in written],
+                         [(0.8, 0), (0.8, 0)])
+        self.assertEqual(mentions.upsert.call_args_list[1].args[0][0]["video_id"], "failed")
+
+    def test_broad_scan_fails_when_valid_response_has_no_batch_videos(self):
+        videos, jobs = self._scan_tables()
+        response = '[{"video_id": "different-video", "entities": []}]'
+        with patch.object(gemini.ds, "call_deepseek_raw", return_value=response, create=True):
+            with self.assertRaisesRegex(RuntimeError, "1배치에서 완료된 영상 없음"):
+                gemini.run_broad_scan()
+        self.assertEqual(jobs.update.call_args.args[0]["status"], "failed")
+        videos.update.assert_not_called()
+
 
 class BTrackDiscoveryTest(unittest.TestCase):
+    def test_saves_only_reported_channels_from_successful_classification_batches(self):
+        facts = {cid: {
+            "channel_title": cid, "subscriber_count": 10000,
+            "description_short": "", "recent_titles": [],
+        } for cid in ("success", "omitted", "failed", "failed-peer")}
+        response = '[{"channel_id": "success", "seed_fitness_score": 0.7}]'
+        generate = Mock(side_effect=[response, RuntimeError("provider unavailable")])
+        db = Mock()
+
+        with patch.object(gemini.ga, "genai_generate_text", generate, create=True), \
+                patch.object(btc, "DISCOVERY_GEMINI_BATCH", 2), \
+                patch.object(discovery.time, "sleep"), redirect_stdout(StringIO()) as output:
+            discovery.stage4_save_and_report(db, discovery.stage3_classify(facts))
+
+        self.assertTrue(facts["success"]["_classified"])
+        for cid in ("omitted", "failed", "failed-peer"):
+            self.assertIsNot(facts[cid].get("_classified"), True)
+        db.table.assert_called_once_with("trend_source_candidates")
+        saved = db.table.return_value.upsert.call_args.args[0]
+        self.assertEqual([row["channel_id"] for row in saved], ["success"])
+        self.assertNotIn("_classified", saved[0])
+        self.assertIn("Gemini 배치 2 실패", output.getvalue())
+
+    def test_unavailable_classifier_leaves_no_candidates_to_save(self):
+        facts = {"channel": {"_classified": True}}
+        db = Mock()
+        with patch.dict(sys.modules, {"gemini_analyzer": None}), redirect_stdout(StringIO()) as output:
+            discovery.stage4_save_and_report(db, discovery.stage3_classify(facts))
+
+        db.table.assert_not_called()
+        self.assertIn("Gemini 초기화 실패", output.getvalue())
+        self.assertIn("단계4: 분류 성공 후보 없음", output.getvalue())
+
     def test_discovers_channels_on_later_pages_and_excludes_existing_candidates(self):
         db = Mock()
         seeds, candidates, videos = Mock(), Mock(), Mock()

@@ -197,7 +197,9 @@ def run_collect(max_sources: int = None):
     now = datetime.now(timezone.utc)
     refresh_cutoff = now - timedelta(hours=btc.COLLECT_REFRESH_HOURS)
     video_cutoff = now - timedelta(days=btc.B_TRACK_REFRESH_DAYS)
-    total_new, total_updated, processed, skipped, stopped = 0, 0, 0, 0, False
+    total_new, total_updated = 0, 0
+    succeeded_channels, failed_channels, skipped = 0, 0, 0
+    stopped = False
 
     for src in sources:
         # 최근 수집한 채널은 이번 회차 skip
@@ -224,7 +226,7 @@ def run_collect(max_sources: int = None):
             db.table('trend_sources').update({
                 'last_collected_at': datetime.now(timezone.utc).isoformat(),
             }).eq('id', src['id']).execute()
-            processed += 1
+            failed_channels += 1
             continue
 
         if not videos:
@@ -232,7 +234,7 @@ def run_collect(max_sources: int = None):
             db.table('trend_sources').update({
                 'last_collected_at': datetime.now(timezone.utc).isoformat(),
             }).eq('id', src['id']).execute()
-            processed += 1
+            succeeded_channels += 1
             continue
 
         # 타입별(숏폼/롱폼) baseline을 수집분에서 직접 계산 (별도 API 호출 없음, 유닛 절약)
@@ -300,9 +302,12 @@ def run_collect(max_sources: int = None):
             'last_collected_at': datetime.now(timezone.utc).isoformat(),
             'total_collected': src.get('total_collected', 0) + len(new_videos),
         }).eq('id', src['id']).execute()
-        processed += 1
+        succeeded_channels += 1
+
+    if not stopped and failed_channels > 0 and succeeded_channels == 0:
+        raise RuntimeError(f"B-track 수집 실패: 시도한 {failed_channels}채널 전부 실패")
 
     tag = "예산소진 중단" if stopped else "완료"
-    print(f"\n✅ 수집 {tag}: 처리 {processed}채널 / skip {skipped} / "
+    print(f"\n✅ 수집 {tag}: 성공 {succeeded_channels}채널 / 실패 {failed_channels}채널 / skip {skipped} / "
           f"신규 {total_new}개 / 갱신 {total_updated}개 / {guard.report()}")
     return total_new
