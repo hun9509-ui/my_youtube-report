@@ -436,6 +436,198 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual([offset for _, offset, _ in requests], [0, 500])
 
 
+class ProcessingKeyFallbackTests(unittest.TestCase):
+    @contextmanager
+    def postgrest(self, respond, error_for_key=None):
+        base_url = "https://example.invalid"
+        requests = []
+
+        def dispatch(request):
+            table = request.url.path.rsplit("/", 1)[-1]
+            params = dict(request.url.params)
+            payload = json.loads(request.content) if request.content else None
+            method = request.method
+            requests.append((method, table, params, payload))
+            uses_key = params.get("on_conflict") == "processing_key" or (
+                "processing_key" in params.get("select", "").split(",")
+            )
+            if uses_key and error_for_key is not None:
+                status, error = error_for_key
+                return httpx.Response(status, json=error)
+            return httpx.Response(200, json=respond(method, table, params, payload))
+
+        with SyncPostgrestClient(base_url) as db, \
+                httpx.Client(base_url=base_url, transport=httpx.MockTransport(dispatch)) as http, \
+                patch.object(db.session, "request", side_effect=http.request), \
+                patch.object(supabase_writer, "get_client", return_value=db):
+            yield requests
+
+    def test_competitor_channel_ids(self):
+        self.assertEqual(config.TARGET_CHANNELS["안녕하세요 최화정이에요"], "UCA9kvKQdNxslWm5IKZgXS_A")
+        self.assertEqual(config.TARGET_CHANNELS["한지혜 Han Ji Hye"], "UCfcEEsjr6_lUUHQ-1zID2cQ")
+
+    def test_daily_state_retries_without_processing_key(self):
+        error = (400, {"code": "42703", "message": "column daily_analysis.processing_key does not exist"})
+        valid = {"video_id": "known", "gemini_raw": {"topic": "valid"}, "deepseek_raw": {}}
+
+        def respond(method, table, params, payload):
+            if table == "video_scores":
+                self.assertEqual(params["score_version"], f"eq.{config.SCORE_VERSION}")
+                return [{"video_id": "known"}]
+            self.assertEqual(params["select"], "video_id,analysis_date,gemini_raw,deepseek_raw")
+            self.assertEqual(params["order"], "id.desc")
+            if params["offset"] == "0":
+                return [{"video_id": "known", "gemini_raw": {}}] * 500
+            self.assertEqual(params["offset"], "500")
+            return [valid]
+
+        with self.postgrest(respond, error) as requests:
+            self.assertEqual(supabase_writer.get_daily_state(["known"]), ({"known": valid}, {"known"}))
+        self.assertEqual(len(requests), 4)
+        self.assertIn("processing_key", requests[0][2]["select"].split(","))
+
+    def test_daily_write_updates_latest_valid_id_then_inserts_only_new_videos(self):
+        error = (400, {"code": "PGRST204", "message": "Could not find the 'processing_key' column"})
+        analyses = [{"video_id": vid, "gemini": {"topic": "new"}} for vid in ("known", "new")]
+
+        def respond(method, table, params, payload):
+            self.assertEqual(table, "daily_analysis")
+            if method == "GET":
+                self.assertEqual(params["order"], "id.desc")
+                self.assertEqual(params["video_id"], "in.(known,new)")
+                return [
+                    {"id": 9, "video_id": "known", "topic": "", "gemini_raw": {"topic": "x"}},
+                    {"id": 8, "video_id": "known", "topic": "x", "gemini_raw": {"error": "failed"}},
+                    {"id": 7, "video_id": "known", "topic": "x", "gemini_raw": {"topic": "x"}},
+                    {"id": 6, "video_id": "known", "topic": "x", "gemini_raw": {"topic": "x"}},
+                ]
+            if method == "PATCH":
+                self.assertEqual(params["id"], "eq.7")
+                self.assertEqual(payload["video_id"], "known")
+                self.assertNotIn("processing_key", payload)
+                return [payload]
+            self.assertEqual([row["video_id"] for row in payload], ["new"])
+            self.assertNotIn("processing_key", payload[0])
+            return payload
+
+        with self.postgrest(respond, error) as requests:
+            self.assertEqual(supabase_writer.save_daily_analysis(analyses), 2)
+        self.assertEqual([request[0] for request in requests], ["POST", "GET", "PATCH", "POST"])
+
+    def test_dated_writes_update_latest_id_or_insert(self):
+        error = (400, {"code": "42703", "message": "column processing_key does not exist"})
+        now = datetime(2026, 11, 26, tzinfo=config.KST)
+        for table, date_column, invoke, expected in (
+            ("weekly_reports", "report_date",
+             lambda: supabase_writer.save_weekly_report({"week_summary": "summary"}, now.date()), True),
+            ("event_keywords", "analysis_date",
+             lambda: supabase_writer.save_trend_classified({"event_keywords": ["keyword"]}), 0),
+        ):
+            for exists in (True, False):
+                with self.subTest(table=table, exists=exists):
+                    def respond(method, name, params, payload):
+                        self.assertEqual(table, name)
+                        if method == "GET":
+                            self.assertEqual(params, {
+                                "select": "id", date_column: "eq.2026-11-26", "order": "id.desc", "limit": "1",
+                            })
+                            return [{"id": 7}] if exists else []
+                        if exists:
+                            self.assertEqual(params["id"], "eq.7")
+                        self.assertEqual(payload[date_column], "2026-11-26")
+                        self.assertNotIn("processing_key", payload)
+                        return [payload]
+
+                    with self.postgrest(respond, error) as requests, patch.object(supabase_writer, "datetime") as clock:
+                        clock.now.return_value = now
+                        self.assertEqual(invoke(), expected)
+                    self.assertEqual([request[0] for request in requests],
+                                     ["POST", "GET", "PATCH" if exists else "POST"])
+
+    def test_trend_write_skips_existing_track_and_video_pairs_but_saves_keywords(self):
+        error = (400, {"code": "PGRST204", "message": "Could not find the 'processing_key' column"})
+        data = {
+            "track_a": [{"video_id": "same"}],
+            "track_b": [{"video_id": "same"}],
+            "event_keywords": ["keyword"],
+        }
+        now = datetime(2026, 11, 26, tzinfo=config.KST)
+
+        def respond(method, table, params, payload):
+            if method == "GET":
+                self.assertEqual(params["analysis_date"], "eq.2026-11-26")
+                if table == "event_keywords":
+                    return [{"id": 3}]
+                self.assertEqual(params["order"], "id")
+                if params["offset"] == "0":
+                    return [{"track": "A", "video_id": str(i)} for i in range(500)]
+                self.assertEqual(params["offset"], "500")
+                return [{"track": "A", "video_id": "same"}]
+            if table == "trend_classified":
+                self.assertEqual([(row["track"], row["video_id"]) for row in payload], [("B", "same")])
+                self.assertNotIn("processing_key", payload[0])
+                return payload
+            self.assertEqual(params["id"], "eq.3")
+            self.assertEqual(payload, {"analysis_date": "2026-11-26", "keywords": ["keyword"]})
+            return [payload]
+
+        with self.postgrest(respond, error) as requests, patch.object(supabase_writer, "datetime") as clock:
+            clock.now.return_value = now
+            self.assertEqual(supabase_writer.save_trend_classified(data), 2)
+        self.assertEqual([(method, table) for method, table, _, _ in requests], [
+            ("POST", "trend_classified"), ("GET", "trend_classified"), ("GET", "trend_classified"),
+            ("POST", "trend_classified"), ("POST", "event_keywords"), ("GET", "event_keywords"),
+            ("PATCH", "event_keywords"),
+        ])
+
+    def test_other_db_errors_do_not_trigger_fallback(self):
+        for error in (
+            (500, {"message": "HTTP 500"}),
+            (403, {"code": "42501", "message": "permission denied for column processing_key"}),
+            (400, {"code": "PGRST204", "message": "Could not find the 'other_column' column"}),
+        ):
+            with self.subTest(error=error):
+                respond = Mock(side_effect=AssertionError("unexpected fallback"))
+                with self.postgrest(respond, error) as requests:
+                    with self.assertRaisesRegex(Exception, error[1]["message"]):
+                        supabase_writer.get_daily_state(["known"])
+                    self.assertEqual(supabase_writer.save_daily_analysis([
+                        {"video_id": "known", "gemini": {"topic": "new"}},
+                    ]), 0)
+                    self.assertFalse(supabase_writer.save_weekly_report({"week_summary": "summary"}))
+                    with self.assertRaisesRegex(Exception, error[1]["message"]):
+                        supabase_writer.save_trend_classified({"track_a": [{"video_id": "known"}]})
+                    with self.assertRaisesRegex(Exception, error[1]["message"]):
+                        supabase_writer.save_trend_classified({"event_keywords": ["keyword"]})
+                respond.assert_not_called()
+                self.assertEqual(len(requests), 5)
+
+    def test_migrated_db_uses_processing_key_without_legacy_writes(self):
+        def respond(method, table, params, payload):
+            if method == "GET":
+                if table == "daily_analysis":
+                    self.assertIn("processing_key", params["select"].split(","))
+                    return [{"video_id": "known", "processing_key": "known", "gemini_raw": {"topic": "x"}}]
+                return []
+            self.assertEqual(method, "POST")
+            self.assertEqual(params["on_conflict"], "processing_key")
+            rows = payload if isinstance(payload, list) else [payload]
+            self.assertTrue(all(row["processing_key"] for row in rows))
+            return rows
+
+        with self.postgrest(respond) as requests:
+            analyses, _ = supabase_writer.get_daily_state(["known"])
+            self.assertEqual(analyses["known"]["processing_key"], "known")
+            self.assertEqual(supabase_writer.save_daily_analysis([
+                {"video_id": "known", "gemini": {"topic": "x"}},
+            ]), 1)
+            self.assertTrue(supabase_writer.save_weekly_report({"week_summary": "summary"}))
+            self.assertEqual(supabase_writer.save_trend_classified({
+                "track_a": [{"video_id": "known"}], "event_keywords": ["keyword"],
+            }), 1)
+        self.assertEqual(len(requests), 6)
+
+
 class ErrorLoggingTests(unittest.TestCase):
     def test_initial_batch_and_history_extend_redact_errors_before_logging_or_alerting(self):
         error = "https://youtube.googleapis.com/test?part=snippet&key=SECRET_KEY&alt=json"

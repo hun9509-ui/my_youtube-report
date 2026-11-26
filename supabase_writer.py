@@ -301,19 +301,19 @@ def save_weekly_report(report: dict, report_date=None) -> bool:
         return False
     today = report_date or datetime.now(config.KST).date()
     week_start = today - timedelta(days=today.weekday())
-    payload = {
-        'report_date': today.isoformat(),
-        'processing_key': week_start.isoformat(),
-        'week_summary': report.get('week_summary', ''),
-        'top_performing_channels': report.get('top_performing_channels', []),
-        'rising_topics': report.get('rising_topics', []),
-        'format_trends': report.get('format_trends', []),
-        'ppl_observations': report.get('ppl_observations', ''),
-        'actionable_insights_for_hangoeun': report.get('actionable_insights_for_hangoeun', []),
-        'next_video_suggestions': report.get('next_video_suggestions', []),
-        'raw_data': report,
-    }
     try:
+        payload = {
+            'report_date': today.isoformat(),
+            'processing_key': week_start.isoformat(),
+            'week_summary': report.get('week_summary', ''),
+            'top_performing_channels': report.get('top_performing_channels', []),
+            'rising_topics': report.get('rising_topics', []),
+            'format_trends': report.get('format_trends', []),
+            'ppl_observations': report.get('ppl_observations', ''),
+            'actionable_insights_for_hangoeun': report.get('actionable_insights_for_hangoeun', []),
+            'next_video_suggestions': report.get('next_video_suggestions', []),
+            'raw_data': report,
+        }
         try:
             result = client.table('weekly_reports').upsert(payload, on_conflict="processing_key").execute()
         except Exception as exc:
