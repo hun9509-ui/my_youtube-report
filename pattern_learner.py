@@ -43,7 +43,7 @@ skincare shopping trend daily video shorts style product recommendation youtube
 """.split())
 _CHECKPOINTS = {3: (2.0, 4.5), 6: (4.5, 8.0), 12: (9.0, 15.0), 24: (20.0, 30.0)}
 _VIDEO_TYPES = ("longform", "shorts")
-_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+_DURATION = re.compile(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?")
 _START_OF_TIME = datetime.min.replace(tzinfo=timezone.utc)
 
 
@@ -105,12 +105,12 @@ def parse_iso_datetime(val) -> datetime | None:
 
 
 def parse_iso_duration_seconds(dur) -> int | None:
-    """Parse the hours, minutes and seconds form of a YouTube ISO duration."""
+    """Parse a YouTube ISO duration expressed in days, hours, minutes and seconds."""
     match = _DURATION.fullmatch(dur) if isinstance(dur, str) else None
-    if not match or not any(match.groups()):
+    if not match or not any(match.groups()) or dur.endswith("T"):
         return None
-    hours, minutes, seconds = (int(part or 0) for part in match.groups())
-    return hours * 3600 + minutes * 60 + seconds
+    days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 def confidence_tier(n: int) -> str:
@@ -942,7 +942,7 @@ def build_learned_playbook(report, *, min_samples=7) -> dict:
         for feature, rows in groups.items():
             eligible = [
                 row for row in rows
-                if sufficient(row) and row["lift"] is not None and row["lift"] != 1
+                if sufficient(row) and row["lift"] is not None
             ]
             if eligible:
                 retained[feature] = eligible
@@ -1037,6 +1037,16 @@ def _render_btrack(lines, btrack):
         (bucket, row["adoption_count"], *_hit_cells(row))
         for bucket, row in btrack["lag_buckets"].items()
     ))
+    adoptions = sorted(
+        btrack["adoptions"], key=lambda row: row["published_at"], reverse=True,
+    )[:10]
+    if adoptions:
+        lines.extend(("### 최근 채택 사례", ""))
+        _table(lines, ("엔티티", "경쟁 영상", "시차(일)", "채널 중앙 대비 조회수"), (
+            (row["entity"], row["title"] or row["video_id"], row["lag_days"],
+             _number_label(row["view_over_channel_median"], "배"))
+            for row in adoptions
+        ))
     lines.extend(("### 트렌드세터 채널", ""))
     _table(lines, ("채널", "카테고리", "선행 히트 영상", "선행 엔티티", "중앙 선행 일수"), (
         (row["source_name"], row["category_hint"], row["celeb_hit_lead_count"],
