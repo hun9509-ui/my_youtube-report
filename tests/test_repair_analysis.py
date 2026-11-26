@@ -441,6 +441,63 @@ class RepairTest(unittest.TestCase):
         self.youtube.assert_not_called()
         self.assertEqual(client.writes, [])
 
+    def test_weekly_cleanup_keeps_older_valid_row_when_newer_same_date_is_blank(self):
+        valid = {"id": 1, "report_date": "2026-05-10", "week_summary": "valid report"}
+        blank_newer = {"id": 2, "report_date": "2026-05-10", "week_summary": "  "}
+        client = FakeClient(weekly_reports=[valid, blank_newer])
+        status, report = self.run_cli(client, "weekly-cleanup", "--apply")
+
+        self.assertEqual(status, 0)
+        self.assertEqual(report["steps"]["weekly-cleanup"]["delete_candidates"], 1)
+        self.assertEqual(client.rows["weekly_reports"], [valid])
+        self.assertEqual(
+            json.loads((self.backups / "weekly_cleanup_backup.json").read_text()),
+            [blank_newer],
+        )
+
+    def test_daily_cleanup_warns_when_deleting_preserved_comments_without_reanalyze(self):
+        orphan = analysis(5, "failed-only", deepseek_raw={"summary": "keep me"})
+        client = FakeClient(daily_analysis=[orphan])
+        status, report = self.run_cli(client, "daily-cleanup")
+
+        self.assertEqual(status, 0)
+        self.assertEqual(report["steps"]["daily-cleanup"]["comments_preserved"], 1)
+        self.assertTrue(report.get("warnings"))
+        self.assertIn("daily-cleanup 단독 실행", self.errors.getvalue())
+        self.assertEqual(client.writes, [])
+
+    def test_dead_sources_treats_missing_items_key_as_probe_error(self):
+        source = {"id": 1, "source_ref": "c1", "active": True, "total_collected": 0}
+        client = FakeClient(trend_sources=[source])
+        self.youtube.return_value.channels.return_value.list.return_value.execute.return_value = {}
+        with patch.object(repair.config, "YOUTUBE_API_KEY", "test-key"):
+            status, report = self.run_cli(client, "dead-sources", "--apply")
+
+        self.assertEqual(status, 0)
+        stats = report["steps"]["dead-sources"]
+        self.assertEqual(stats["confirmed_dead_ids"], [])
+        self.assertEqual(stats["probe_errors"], 1)
+        self.assertEqual(stats["disabled"], 0)
+        self.assertEqual(client.writes, [])
+        self.assertTrue(client.rows["trend_sources"][0]["active"])
+
+    def test_existing_json_report_path_aborts_before_any_apply_mutation(self):
+        client = FakeClient(weekly_reports=[{"id": 1, "report_date": "2026-01-01", "week_summary": ""}])
+        existing_report = self.root / "existing-report.json"
+        existing_report.write_text("{\"keep\": true}\n", encoding="utf-8")
+
+        with patch.object(repair.db, "get_client", return_value=client):
+            status = repair.main([
+                "--steps", "weekly-cleanup", "--apply", "--delay", "0",
+                "--backup-dir", str(self.backups), "--json-report", str(existing_report),
+            ])
+
+        self.assertEqual(status, 1)
+        self.assertEqual(existing_report.read_text(encoding="utf-8"), "{\"keep\": true}\n")
+        self.assertEqual(client.writes, [])
+        self.assertFalse(self.backups.exists())
+        self.assertIn("error", json.loads(self.output.getvalue()))
+
 
 class PhaseOneRegressionTest(unittest.TestCase):
     def test_score_batch_masks_exception(self):

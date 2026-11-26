@@ -202,6 +202,13 @@ class Repair:
             "comment_merges": len(merges), "processing_key_backfills": len(keys),
             "comments_preserved": len(self.preserved_deepseek),
         }
+        if self.preserved_deepseek and "daily-reanalyze" not in self.args.steps:
+            msg = (
+                f"daily-cleanup 단독 실행으로 유효 댓글 분석이 포함된 실패 전용 영상 "
+                f"{len(self.preserved_deepseek)}건이 삭제 후보에 포함되어 메모리/백업 JSON에만 보존됩니다."
+            )
+            self.report.setdefault("warnings", []).append(msg)
+            print(f"⚠️ {msg}", file=sys.stderr)
         if self.args.apply and (deleted or merges or keys):
             originals = {row["id"]: row for row in deleted + keys + [row for row, _ in merges]}
             self._backup("daily_cleanup_backup.json", list(originals.values()))
@@ -415,9 +422,9 @@ class Repair:
 
     def weekly_cleanup(self):
         rows = self._rows("weekly_reports")
-        latest = {row["report_date"]: row["id"] for row in rows}
+        latest = {row["report_date"]: row["id"] for row in rows if (row.get("week_summary") or "").strip()}
         deleted = [row for row in rows if not (row.get("week_summary") or "").strip()
-                   or row["id"] != latest[row["report_date"]]]
+                   or row["id"] != latest.get(row["report_date"])]
         self.report["steps"]["weekly-cleanup"] = {"delete_candidates": len(deleted)}
         if self.args.apply and deleted:
             self._backup("weekly_cleanup_backup.json", deleted)
@@ -429,9 +436,12 @@ class Repair:
 
     def _source_is_dead(self, channel_id):
         try:
-            items = self.youtube.channels().list(part="contentDetails", id=channel_id).execute()["items"]
+            response = self.youtube.channels().list(part="contentDetails", id=channel_id).execute()
+            items = response.get("items") if isinstance(response, dict) else None
             if items == []:
                 return True
+            if not isinstance(items, list):
+                raise ValueError("YouTube channels.list 응답에 items 누락")
             uploads_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
             self.youtube.playlistItems().list(part="id", playlistId=uploads_id, maxResults=1).execute()
         except HttpError as exc:
@@ -512,21 +522,40 @@ def _arguments(argv):
     return args
 
 
+def _validate_json_report_path(path: Path):
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"JSON 리포트 경로가 이미 존재합니다: {path}")
+    parent = path.parent
+    if not parent.exists() or not parent.is_dir():
+        raise FileNotFoundError(f"JSON 리포트 상위 디렉토리가 없습니다: {parent}")
+    if not os.access(parent, os.W_OK):
+        raise PermissionError(f"JSON 리포트 상위 디렉토리에 쓰기 권한이 없습니다: {parent}")
+
+
 def main(argv=None) -> int:
     args = _arguments(argv)
     report = {"apply": args.apply, "steps": {}}
+    report_path_valid = True
     try:
-        client = db.get_client()
-        if client is None:
-            raise RuntimeError("Supabase 연결 설정 누락")
-        repair = Repair(client, args)
-        report = repair.report
-        ok = repair.run()
+        if args.json_report:
+            _validate_json_report_path(args.json_report)
     except Exception as exc:
+        report_path_valid = False
         report["error"] = safe_error(exc)
         ok = False
+    else:
+        try:
+            client = db.get_client()
+            if client is None:
+                raise RuntimeError("Supabase 연결 설정 누락")
+            repair = Repair(client, args)
+            report = repair.report
+            ok = repair.run()
+        except Exception as exc:
+            report["error"] = safe_error(exc)
+            ok = False
 
-    if args.json_report:
+    if args.json_report and report_path_valid:
         try:
             # Exclusive creation also protects backup files from report path aliases.
             with args.json_report.open("x", encoding="utf-8") as output:
