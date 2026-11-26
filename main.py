@@ -16,7 +16,6 @@
 """
 import sys
 import time
-import traceback
 from datetime import datetime, timedelta, timezone
 from analysis_schema import CommentAnalysis, MarketAnalysis, WeeklyReport
 from gemini_client import has_text, safe_error
@@ -71,7 +70,8 @@ def validate_env(mode):
         required["GEMINI_API_KEY"] = config.GEMINI_API_KEY
 
     missing = [key for key, value in required.items() if not value]
-    if mode in {"b-track-scan", "b-track-run"} and not (config.DEEPSEEK_API_KEY or config.GEMINI_API_KEY):
+    if (mode in {"b-track-scan", "b-track-run"} and config.GEMINI_PROVIDER == "ai_studio"
+            and not (config.DEEPSEEK_API_KEY or config.GEMINI_API_KEY)):
         missing.append("DEEPSEEK_API_KEY 또는 GEMINI_API_KEY")
     if missing:
         print(f"❌ 누락된 환경변수: {', '.join(missing)}")
@@ -204,9 +204,8 @@ def run_initial_batch(batch_num: int):
             channel_videos_map[name] = videos
             time.sleep(2)
         except Exception as e:
-            print(f"❌ 채널 실패 ({name}): {e}")
-            traceback.print_exc()
-            tg.send_error_alert(str(e), f"배치#{batch_num} - {name}")
+            print(f"❌ 채널 실패 ({name}): {safe_error(e)}")
+            tg.send_error_alert(safe_error(e), f"배치#{batch_num} - {name}")
 
     print(f"\n📊 배치#{batch_num} 총 영상: {len(all_videos)}개")
     if not all_videos:
@@ -279,7 +278,7 @@ def run_initial_batch(batch_num: int):
                 print(f"  ⭐ [{video.get('view_count',0):,}회] {video.get('title','')[:45]}")
                 time.sleep(2)
             except Exception as e:
-                print(f"  ⚠️ hit_analysis 실패 ({video.get('video_id','')}): {e}")
+                print(f"  ⚠️ hit_analysis 실패 ({video.get('video_id','')}): {safe_error(e)}")
 
     print(f"\n🎯 채널별 성공공식 분석")
     insights: dict[str, dict] = {}
@@ -290,8 +289,8 @@ def run_initial_batch(batch_num: int):
             insights[name] = ds.derive_channel_success_formula(name, vids)
             time.sleep(2)
         except Exception as e:
-            print(f"  ⚠️ {name} 인사이트 실패: {e}")
-            insights[name] = {"error": str(e)}
+            print(f"  ⚠️ {name} 인사이트 실패: {safe_error(e)}")
+            insights[name] = {"error": safe_error(e)}
 
     sheets.save_channel_insights(insights)
     db.save_channel_insights(insights)
@@ -588,32 +587,41 @@ def run_own_channel_daily() -> bool:
             video for video in detailed
             if cutoff < datetime.fromisoformat(video["published_at"].replace("Z", "+00:00")) <= now
         ]
-        new_videos = [v for v in recent if not db.is_own_video_analyzed(v["video_id"])]
+        existing = db.get_own_channel_state([v["video_id"] for v in recent])
+        pending = [
+            v for v in recent
+            if v["video_id"] not in existing
+            or (v.get("comment_count", 0) > 0
+                and "error" in (existing[v["video_id"]].get("deepseek_raw") or {}))
+        ]
     except Exception as exc:
         error = safe_error(exc)
         print(f"❌ 자체 채널 수집 실패: {error}")
         tg.send_error_alert(error, "자체 채널 수집")
         return False
 
-    if not new_videos:
+    if not pending:
         print("📭 새 영상 없음")
         return tg.send_message(f"📺 자체 채널: 새 영상 없음 ({now:%m/%d})")
 
-    print(f"📹 새 영상 {len(new_videos)}개 발견")
+    print(f"📹 분석 대상 영상 {len(pending)}개")
     success = True
-    for video in new_videos:
+    for video in pending:
         video_id = video["video_id"]
+        prior = existing.get(video_id)
         context = f"자체채널 - {video.get('title', '')[:30]}"
         try:
             video["video_type"] = "shorts" if yt.is_shorts(video) else "longform"
             print(f"📹 {video['title'][:50]}")
-            if not db.save_own_video(video):
-                raise RuntimeError("자체 채널 영상 메타데이터 저장 실패")
-
-            gemini_result = gemini.analyze_own_video(video)
-            if not has_text(gemini_result, "topic"):
-                error = gemini_result.get("error") if isinstance(gemini_result, dict) else None
-                raise RuntimeError(error or "Gemini 분석에 필수 항목 topic 누락")
+            if prior:
+                gemini_result = prior["gemini_raw"]
+            else:
+                if not db.save_own_video(video):
+                    raise RuntimeError("자체 채널 영상 메타데이터 저장 실패")
+                gemini_result = gemini.analyze_own_video(video)
+                if not has_text(gemini_result, "topic"):
+                    error = gemini_result.get("error") if isinstance(gemini_result, dict) else None
+                    raise RuntimeError(error or "Gemini 분석에 필수 항목 topic 누락")
 
             comments_result = {}
             if video.get("comment_count", 0) > 0:
@@ -634,6 +642,8 @@ def run_own_channel_daily() -> bool:
                     comments_result = {"error": error}
                     tg.send_error_alert(error, f"{context} 댓글")
                     success = False
+                    if prior:
+                        continue
 
             if not db.save_own_analysis(video_id, gemini_result, comments_result):
                 raise RuntimeError("자체 채널 분석 저장 실패")
@@ -694,7 +704,7 @@ def run_score_backfill():
             if video.get('video_id'):
                 all_videos_map[video['video_id']] = video
         except Exception as e:
-            print(f"  ⚠️ 스코어링 실패 ({analysis.get('video_id', '')}): {e}")
+            print(f"  ⚠️ 스코어링 실패 ({analysis.get('video_id', '')}): {safe_error(e)}")
 
     for video, analysis in daily_rows:
         try:
@@ -703,7 +713,7 @@ def run_score_backfill():
             if video.get('video_id'):
                 all_videos_map[video['video_id']] = video
         except Exception as e:
-            print(f"  ⚠️ 스코어링 실패 ({analysis.get('video_id', '')}): {e}")
+            print(f"  ⚠️ 스코어링 실패 ({analysis.get('video_id', '')}): {safe_error(e)}")
 
     if not all_scores:
         print("⚠️ 스코어링 결과 없음")
@@ -767,9 +777,8 @@ def run_score_sheets_sync():
         print(f"✅ 동기화 완료: {saved}개 추가 ({duration:.0f}초)")
 
     except Exception as e:
-        print(f"❌ 동기화 실패: {e}")
-        traceback.print_exc()
-        tg.send_error_alert(str(e), "score-sheets-sync")
+        print(f"❌ 동기화 실패: {safe_error(e)}")
+        tg.send_error_alert(safe_error(e), "score-sheets-sync")
 
 
 def run_own_channel_backfill():
@@ -870,7 +879,7 @@ def run_own_channel_track():
             time.sleep(1)
 
         except Exception as e:
-            print(f"⚠️ 추적 실패 ({video_id}): {e}")
+            print(f"⚠️ 추적 실패 ({video_id}): {safe_error(e)}")
 
     if results:
         sheets.save_own_tracking(results)
@@ -1035,7 +1044,7 @@ def run_thumbnail_backfill():
                 success += 1
             time.sleep(3)
         except Exception as e:
-            print(f"  ❌ 예외 ({video.get('video_id','')}): {e}")
+            print(f"  ❌ 예외 ({video.get('video_id','')}): {safe_error(e)}")
             errors += 1
 
     duration = time.time() - start
@@ -1145,7 +1154,7 @@ def run_full_backfill():
                 thumb_err += 1
             time.sleep(3)
         except Exception as e:
-            print(f"  ❌ 썸네일 실패 ({video.get('video_id','')}): {e}")
+            print(f"  ❌ 썸네일 실패 ({video.get('video_id','')}): {safe_error(e)}")
             thumb_err += 1
 
     # 전략 스코어
@@ -1208,8 +1217,8 @@ def run_history_extend(extra_months: int = 6):
             time.sleep(2)
 
         except Exception as e:
-            print(f"  ❌ {name}: {e}")
-            tg.send_error_alert(str(e), f"history-extend - {name}")
+            print(f"  ❌ {name}: {safe_error(e)}")
+            tg.send_error_alert(safe_error(e), f"history-extend - {name}")
 
     if not all_new:
         print("📭 추가 수집 영상 없음")
@@ -1321,7 +1330,7 @@ def run_comment_backfill():
 
         except Exception as e:
             errors += 1
-            print(f"  [{i+1}/{len(targets)}] ❌ 예외: {e}")
+            print(f"  [{i+1}/{len(targets)}] ❌ 예외: {safe_error(e)}")
 
         if (i + 1) % 20 == 0:
             elapsed = time.time() - start

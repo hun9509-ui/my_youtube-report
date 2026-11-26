@@ -261,7 +261,7 @@ def get_videos_from_sheet(days_back=7):
             .in_('video_id', video_ids).execute()
         return [{'채널명': v['channel_title'], '제목': v['title'], '조회수': v['view_count']} for v in vids.data]
     except Exception as e:
-        print(f"  ⚠️ 최근 영상 조회 실패: {e}")
+        print(f"  ⚠️ 최근 영상 조회 실패: {safe_error(e)}")
         return []
 
 
