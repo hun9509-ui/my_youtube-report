@@ -40,9 +40,9 @@ def _atrack_channel_ids() -> set:
 def _existing_exclusions(db) -> set:
     """이미 시드거나 이미 후보로 점수화된 채널 — 재발굴 제외"""
     excl = set()
-    seeds = _read_pages(db.table('trend_sources').select('source_ref').order('id'))
+    seeds = _read_pages(lambda: db.table('trend_sources').select('source_ref').order('id'))
     excl.update(s['source_ref'] for s in seeds)
-    cands = _read_pages(db.table('trend_source_candidates').select('channel_id').order('channel_id'))
+    cands = _read_pages(lambda: db.table('trend_source_candidates').select('channel_id').order('channel_id'))
     excl.update(c['channel_id'] for c in cands)
     return excl
 
@@ -53,7 +53,7 @@ def _existing_exclusions(db) -> set:
 def stage0_db_internal(db, exclude: set) -> dict:
     """trend_videos에 등장하지만 시드/후보가 아닌 채널.
     반환: {channel_id: {'channel_title':.., 'paths':['stage0']}}"""
-    rows = _read_pages(db.table('trend_videos').select('channel_id,channel_title').order('video_id'))
+    rows = _read_pages(lambda: db.table('trend_videos').select('channel_id,channel_title').order('video_id'))
     atrack = _atrack_channel_ids()
     found = {}
     for r in rows:

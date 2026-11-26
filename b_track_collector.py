@@ -179,11 +179,11 @@ def run_collect(max_sources: int = None):
     # never-collected(NULL) 먼저 → 그다음 오래된 것부터.
     # (PostgREST asc는 NULLS LAST가 기본이라 두 단계로 명시 분리)
     never = _read_pages(
-        db.table('trend_sources').select('*').eq('active', True)
+        lambda: db.table('trend_sources').select('*').eq('active', True)
         .is_('last_collected_at', 'null').order('priority', desc=True).order('id')
     )
     older = _read_pages(
-        db.table('trend_sources').select('*').eq('active', True)
+        lambda: db.table('trend_sources').select('*').eq('active', True)
         .not_.is_('last_collected_at', 'null').order('last_collected_at').order('id')
     )
     sources = never + older

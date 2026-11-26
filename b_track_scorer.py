@@ -326,21 +326,21 @@ def _load_mentions_for_entities(db, entity_ids: list[int]) -> dict[int, list[dic
     rows = []
     for i in range(0, len(entity_ids), 50):
         batch = entity_ids[i:i + 50]
-        query = (
-            db.table("entity_mentions").select("*").in_("entity_id", batch)
+        rows.extend(_read_pages(
+            lambda: db.table("entity_mentions").select("*").in_("entity_id", batch)
             .or_(f"published_at.gte.{cutoff},and(published_at.is.null,created_at.gte.{cutoff})")
             .order("entity_id").order("video_id")
-        )
-        rows.extend(_read_pages(query))
+        ))
 
     video_ids = sorted({r.get("video_id") for r in rows if r.get("video_id")})
     videos = {}
     for i in range(0, len(video_ids), 100):
         batch = video_ids[i:i + 100]
-        query = db.table("trend_videos").select(
-            "video_id,title,channel_title,view_count,view_over_baseline,video_type"
-        ).in_("video_id", batch).order("video_id")
-        for video in _read_pages(query):
+        for video in _read_pages(
+            lambda: db.table("trend_videos").select(
+                "video_id,title,channel_title,view_count,view_over_baseline,video_type"
+            ).in_("video_id", batch).order("video_id")
+        ):
             videos[video["video_id"]] = video
 
     for row in rows:
@@ -360,10 +360,11 @@ def _load_mentions_for_entities(db, entity_ids: list[int]) -> dict[int, list[dic
 def run_score(max_entities: int = 500) -> int:
     """B-track 엔티티 점수/답변카드 생성 후 Supabase에 저장."""
     db = _db()
-    query = db.table("trend_entities").select(
-        "id,name,entity_type,category"
-    ).order("last_seen_at", desc=True).order("id")
-    entities = _read_pages(query, max_rows=max_entities)
+    entities = _read_pages(
+        lambda: db.table("trend_entities").select("id,name,entity_type,category")
+        .order("last_seen_at", desc=True).order("id"),
+        max_rows=max_entities,
+    )
 
     if not entities:
         print("  ℹ️ 점수화할 trend_entities 없음")

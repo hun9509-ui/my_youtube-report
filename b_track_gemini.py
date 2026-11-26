@@ -130,13 +130,12 @@ def run_broad_scan(max_videos: int = None):
     batch_size = btc.BROAD_SCAN_BATCH_SIZE
 
     # 미분석 영상 로드
-    unscanned = db.table('trend_videos').select(
-        'video_id,channel_id,channel_title,title,description_short,view_count,published_at'
-    ).eq('broad_scan_done', False).order(
-        'view_over_baseline', desc=True
-    ).order('video_id')
-
-    videos = _read_pages(unscanned, max_rows=max_videos)
+    videos = _read_pages(
+        lambda: db.table('trend_videos').select(
+            'video_id,channel_id,channel_title,title,description_short,view_count,published_at'
+        ).eq('broad_scan_done', False).order('view_over_baseline', desc=True).order('video_id'),
+        max_rows=max_videos,
+    )
     if not videos:
         print("  ℹ️ 브로드 스캔할 영상 없음")
         return 0
@@ -282,7 +281,7 @@ def run_cluster():
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     mentions = _read_pages(
-        db.table('entity_mentions').select('entity_id,channel_id,view_count_at_scan,published_at')
+        lambda: db.table('entity_mentions').select('entity_id,channel_id,view_count_at_scan,published_at')
         .gte('created_at', cutoff).order('entity_id').order('video_id')
     )
 
@@ -303,7 +302,7 @@ def run_cluster():
     # 상위 엔티티 → 클러스터 갱신
     top_eids = sorted(agg, key=lambda eid: -agg[eid]['count'])[:100]
     entities = _read_pages(
-        db.table('trend_entities').select('id,name,category').in_('id', top_eids).order('id')
+        lambda: db.table('trend_entities').select('id,name,category').in_('id', top_eids).order('id')
     )
     entity_map = {e['id']: e for e in entities}
 

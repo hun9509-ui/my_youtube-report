@@ -84,13 +84,14 @@ def _safe_error(error):
     return safe_error(message)[:500]
 
 
-def _read_pages(query, page_size=1000, *, max_rows=None):
+def _read_pages(build_query, page_size=1000, *, max_rows=None):
     """Read an explicitly ordered PostgREST query with inclusive ranges."""
     rows = []
     while max_rows is None or len(rows) < max_rows:
         offset = len(rows)
         size = page_size if max_rows is None else min(page_size, max_rows - offset)
-        page = query.range(offset, offset + size - 1).execute().data or []
+        # PostgREST appends range parameters to the builder, so each page needs a fresh one.
+        page = build_query().range(offset, offset + size - 1).execute().data or []
         rows.extend(page)
         if len(page) < size:
             break
