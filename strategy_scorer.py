@@ -63,9 +63,9 @@ def score_video(video: dict, analysis: dict, source_table: str, thumbnail: dict 
     title_emotion   = str(gemini.get('title_emotion_tone') or analysis.get('title_emotion_tone', '')).lower()
     content_struct  = str(gemini.get('content_structure') or analysis.get('content_structure', '')).lower()
     hook_strategy   = str(gemini.get('hook_strategy')    or analysis.get('hook_strategy', '')).lower()
-    unique_diff     = str(gemini.get('unique_differentiator') or '').lower()
+    unique_diff     = str(gemini.get('unique_differentiator') or '').strip().lower()
     applicability   = str(gemini.get('applicability')    or analysis.get('applicability', '')).strip()
-    viral_signals   = str(comments.get('viral_signals')  or '').lower()
+    viral_signals   = str(comments.get('viral_signals')  or '').strip().lower()
 
     # ppl_likely: bool 또는 문자열 둘 다 허용
     ppl_raw = gemini.get('ppl_likely')
@@ -77,7 +77,6 @@ def score_video(video: dict, analysis: dict, source_table: str, thumbnail: dict 
         ppl_likely = bool(ppl_raw)
 
     combined = f"{title} {topic} {category}"
-    content_context = f"{combined} {content_struct}"
     emotion_temperature = comments.get('emotion_temperature') or {}
     if not isinstance(emotion_temperature, dict):
         emotion_temperature = {}
@@ -99,7 +98,7 @@ def score_video(video: dict, analysis: dict, source_table: str, thumbnail: dict 
             fit += points
             fit_trace.append(f"category={label} {points:+d}")
             break
-    if _contains_any(content_context, ['부부', '남편', '가족', '게스트', '친구', '수다', '토크']):
+    if _contains_any(f"{combined} {content_struct}", ['부부', '남편', '가족', '게스트', '친구', '수다', '토크']):
         fit += 12
         fit_trace.append("persona/talk keyword +12")
     if _contains_any(combined, ['전문 메이크업', '정치', '게임', '논란']):
@@ -126,10 +125,10 @@ def score_video(video: dict, analysis: dict, source_table: str, thumbnail: dict 
 
     exec_bonus = -10 if ppl_likely else 6
     exec_trace.append(f"ppl_likely={ppl_likely} {exec_bonus:+d}")
-    if _contains_any(content_context, ['여행', '해외', '야외 촬영']):
+    if _contains_any(combined, ['여행', '해외', '야외 촬영']):
         exec_bonus -= 12
         exec_trace.append("travel/outdoor -12")
-    if _contains_any(content_context, ['부부', '토크', '게스트']):
+    if _contains_any(combined, ['부부', '토크', '게스트']):
         exec_bonus += 8
         exec_trace.append("couple/talk/guest +8")
 
@@ -145,8 +144,8 @@ def score_video(video: dict, analysis: dict, source_table: str, thumbnail: dict 
     elif '브이로그형' in content_struct:
         rep += 5
         rep_trace.append("content_structure=브이로그형 +5")
-    if _contains_any(content_context, ['토크', '수다', '게스트', '부부', '패션', '뷰티',
-                                       '추천', '템', '관리', '스타일', '코디']):
+    if _contains_any(combined, ['토크', '수다', '게스트', '부부', '패션', '뷰티',
+                                '추천', '템', '관리', '스타일', '코디']):
         rep += 18
         rep_trace.append("series keyword +18")
 

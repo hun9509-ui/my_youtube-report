@@ -1252,7 +1252,7 @@ def main(argv=None) -> int:
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--lookback-days", type=int, default=210)
     parser.add_argument("--min-samples", type=int, default=7)
-    parser.add_argument("--score-version")
+    parser.add_argument("--score-version", help="백테스트 점수 버전 (예: v1.2, v2.0). 기본값은 config.SCORE_VERSION.")
     parser.add_argument("--skip-btrack", action="store_true")
     args = parser.parse_args(argv)
     if args.lookback_days < 1 or args.min_samples < 1:
