@@ -331,7 +331,8 @@ class Repair:
 
         return apply
 
-    def _score_plan(self, stats, videos, scores):
+    def _score_plan(self, stats, videos, scores, thumbnails=None):
+        thumbnails = thumbnails or {}
         initial, daily_rows = self._analysis_rows()
         daily = _latest(daily_rows, _is_valid_gemini)
         existing = {row["video_id"]: row for row in scores}
@@ -344,7 +345,9 @@ class Repair:
             if not isinstance(analysis.get("deepseek_raw"), dict):
                 analysis = {**analysis, "deepseek_raw": {}}
             try:
-                score = strategy_scorer.score_video(videos.get(video_id, {}), analysis, source)
+                score = strategy_scorer.score_video(
+                    videos.get(video_id, {}), analysis, source, thumbnail=thumbnails.get(video_id),
+                )
                 old = existing.get(video_id)
                 if old is None or any(old.get(field) != score.get(field) for field in SCORE_FIELDS):
                     changed.append(score)
@@ -356,6 +359,7 @@ class Repair:
 
     def scores_recompute(self):
         videos = {row["video_id"]: row for row in self._rows("videos", "video_id")}
+        thumbnails = {row["video_id"]: row for row in self._rows("thumbnail_analysis", "video_id")}
         scores = self._rows("video_scores", score_version=config.SCORE_VERSION)
         stats = self.report["steps"]["scores-recompute"] = {"saved": 0, "orphans_deleted": 0, "failed": 0}
         daily_changes_first = self.args.apply and bool(
@@ -366,7 +370,7 @@ class Repair:
             originals = scores
             possible_orphans = scores
         else:
-            changed, orphans = self._score_plan(stats, videos, scores)
+            changed, orphans = self._score_plan(stats, videos, scores, thumbnails)
             changed_ids = {row["video_id"] for row in changed}
             originals = [row for row in scores if row["video_id"] in changed_ids]
             possible_orphans = orphans
@@ -377,7 +381,9 @@ class Repair:
                 self._backup("orphan_scores_backup.json", possible_orphans)
 
         def apply():
-            upserts, orphan_rows = self._score_plan(stats, videos, scores) if daily_changes_first else (changed, orphans)
+            upserts, orphan_rows = (
+                self._score_plan(stats, videos, scores, thumbnails) if daily_changes_first else (changed, orphans)
+            )
             for chunk in _in_batches(upserts):
                 saved = db.save_video_scores(chunk)
                 stats["saved"] += saved
