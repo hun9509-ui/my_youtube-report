@@ -348,13 +348,17 @@ def save_trend_classified(classified: dict) -> int:
 
 def is_own_video_analyzed(video_id: str) -> bool:
     """분석까지 완료된 자체 채널 영상인지 확인 (own_channel_analysis 기준)"""
-    client = get_client()
-    if not client:
-        return False
     try:
-        result = client.table('own_channel_analysis').select('video_id').eq('video_id', video_id).execute()
-        return len(result.data) > 0
-    except Exception:
+        client = get_client()
+        if not client:
+            return False
+        result = client.table('own_channel_analysis').select('video_id,topic,gemini_raw').eq('video_id', video_id).execute()
+        return any(
+            has_text(row.get('gemini_raw'), 'topic') and bool((row.get('topic') or '').strip())
+            for row in result.data
+        )
+    except Exception as e:
+        print(f"  ⚠️ own_channel_analysis 조회 실패: {safe_error(e)}")
         return False
 
 
@@ -379,54 +383,65 @@ def save_own_video(video: dict) -> bool:
         }).execute()
         return True
     except Exception as e:
-        print(f"  ⚠️ own_channel_videos 저장 실패: {e}")
+        print(f"  ⚠️ own_channel_videos 저장 실패: {safe_error(e)}")
         return False
 
 
-def save_own_analysis(video_id: str, gemini_result: dict, comments_result: dict):
+def save_own_analysis(video_id: str, gemini_result: dict, comments_result: dict) -> bool:
     """자체 채널 분석 결과 저장"""
-    client = get_client()
-    if not client:
-        return
-    today = datetime.now().date().isoformat()
-    gemini = gemini_result or {}
+    if not has_text(gemini_result, "topic"):
+        return False
+
+    today = datetime.now(config.KST).date().isoformat()
+    gemini = gemini_result
     comments = comments_result or {}
     sentiment = comments.get('sentiment', {}) if isinstance(comments, dict) else {}
+
+    def text_value(source, field):
+        value = source.get(field, "")
+        return ", ".join(map(str, value)) if isinstance(value, list) else value
+
     try:
-        client.table('own_channel_analysis').upsert({
+        client = get_client()
+        if not client:
+            return False
+        result = client.table('own_channel_analysis').upsert({
             'video_id': video_id,
             'analysis_date': today,
-            'topic': gemini.get('topic', ''),
-            'content_structure': gemini.get('content_structure', ''),
-            'title_pattern': gemini.get('title_pattern', ''),
-            'title_emotion_tone': gemini.get('title_emotion_tone', ''),
-            'hook_strategy': gemini.get('hook_strategy', ''),
+            'topic': text_value(gemini, 'topic'),
+            'content_structure': text_value(gemini, 'content_structure'),
+            'title_pattern': text_value(gemini, 'title_pattern'),
+            'title_emotion_tone': text_value(gemini, 'title_emotion_tone'),
+            'hook_strategy': text_value(gemini, 'hook_strategy'),
             'ppl_likely': gemini.get('ppl_likely', False),
-            'ppl_signals': gemini.get('ppl_signals', ''),
-            'target_audience': gemini.get('target_audience', ''),
-            'predicted_performance': gemini.get('predicted_performance', ''),
-            'predicted_performance_reason': gemini.get('predicted_performance_reason', ''),
-            'strengths': gemini.get('strengths', ''),
-            'improvement_points': gemini.get('improvement_points', ''),
-            'thumbnail_suggestion': gemini.get('thumbnail_suggestion', ''),
-            'competitor_angle': gemini.get('competitor_angle', ''),
+            'ppl_signals': text_value(gemini, 'ppl_signals'),
+            'target_audience': text_value(gemini, 'target_audience'),
+            'predicted_performance': text_value(gemini, 'predicted_performance'),
+            'predicted_performance_reason': text_value(gemini, 'predicted_performance_reason'),
+            'strengths': text_value(gemini, 'strengths'),
+            'improvement_points': text_value(gemini, 'improvement_points'),
+            'thumbnail_suggestion': text_value(gemini, 'thumbnail_suggestion'),
+            'competitor_angle': text_value(gemini, 'competitor_angle'),
             'sentiment': sentiment,
             'praise_points': comments.get('praise_points', []),
             'complaints': comments.get('complaints', []),
             'next_video_requests': comments.get('next_video_requests', []),
-            'new_viewer_signals': comments.get('new_viewer_signals', ''),
-            'fan_engagement': comments.get('fan_engagement', ''),
-            'viral_signals': comments.get('viral_signals', ''),
+            'new_viewer_signals': text_value(comments, 'new_viewer_signals'),
+            'fan_engagement': text_value(comments, 'fan_engagement'),
+            'viral_signals': text_value(comments, 'viral_signals'),
             'revisit_intent': comments.get('revisit_intent', 0),
-            'ppl_reaction': comments.get('ppl_reaction', ''),
-            'creator_feedback': comments.get('creator_feedback', ''),
-            'comments_summary': comments.get('summary', ''),
+            'ppl_reaction': text_value(comments, 'ppl_reaction'),
+            'creator_feedback': text_value(comments, 'creator_feedback'),
+            'comments_summary': text_value(comments, 'summary'),
             'gemini_raw': {**gemini, '_version': config.ANALYSIS_VERSION},
             'deepseek_raw': {**comments, '_version': config.ANALYSIS_VERSION},
         }).execute()
-        print(f"  💾 Supabase: own_channel_analysis 저장 ({video_id[:8]}...)")
+        if result.data:
+            print(f"  💾 Supabase: own_channel_analysis 저장 ({video_id[:8]}...)")
+        return bool(result.data)
     except Exception as e:
-        print(f"  ⚠️ own_channel_analysis 저장 실패: {e}")
+        print(f"  ⚠️ own_channel_analysis 저장 실패: {safe_error(e)}")
+        return False
 
 
 def get_all_own_analyses() -> list:

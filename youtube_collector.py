@@ -169,11 +169,14 @@ def get_video_details(video_ids, min_duration=None):
 
 
 def is_shorts(video):
-    """숏츠 여부 판별: #shorts 태그 또는 60초 이하"""
+    """숏츠 여부 판별: #shorts 표기 또는 설정된 길이 이내."""
     title = video.get('title', '').lower()
-    tags = video.get('tags', '').lower()
+    tags = video.get('tags', '')
+    if isinstance(tags, list):
+        tags = ','.join(tags)
+    tags = tags.lower()
     duration_seconds = video.get('duration_seconds', 0)
-    return '#shorts' in title or '#shorts' in tags or duration_seconds <= 60
+    return '#shorts' in title or '#shorts' in tags or 0 < duration_seconds <= config.SHORTS_MAX_SECONDS
 
 
 def get_video_comments(video_id, max_comments=200, *, raise_on_error=False):
@@ -218,8 +221,10 @@ def get_video_comments(video_id, max_comments=200, *, raise_on_error=False):
     return comments
 
 
-def get_trending_videos(category_id="0", region="KR", max_results=50):
-    """한국 트렌딩 영상 가져오기"""
+def get_trending_videos(category_id="0", region="KR", max_results=50, min_duration=None):
+    """트렌딩 영상을 조회한다. 기본 5분 이상, min_duration=0이면 전체."""
+    if min_duration is None:
+        min_duration = MIN_VIDEO_DURATION_SECONDS
     youtube = get_youtube_client()
     
     response = youtube.videos().list(
@@ -234,6 +239,10 @@ def get_trending_videos(category_id="0", region="KR", max_results=50):
     for item in response.get('items', []):
         snippet = item.get('snippet', {})
         stats = item.get('statistics', {})
+        duration = item.get('contentDetails', {}).get('duration', '')
+        duration_seconds = parse_duration(duration)
+        if min_duration > 0 and duration_seconds < min_duration:
+            continue
         
         trending.append({
             'video_id': item['id'],
@@ -246,6 +255,8 @@ def get_trending_videos(category_id="0", region="KR", max_results=50):
             'comment_count': int(stats.get('commentCount', 0)),
             'tags': snippet.get('tags', [])[:10],
             'category_id': snippet.get('categoryId', ''),
+            'duration': duration,
+            'duration_seconds': duration_seconds,
             'video_url': f"https://youtube.com/watch?v={item['id']}"
         })
     

@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 import config
+from gemini_client import has_text, safe_error
 
 
 _sh = None
@@ -29,8 +30,17 @@ def _get_sheet():
         _sh = gspread.authorize(creds).open_by_key(config.GOOGLE_SHEET_ID)
         return _sh
     except Exception as e:
-        print(f"  ⚠️ 스프레드시트 초기화 실패: {e}")
+        print(f"  ⚠️ 스프레드시트 초기화 실패: {safe_error(e)}")
         return None
+
+
+def _normalize_row(row):
+    return [
+        ", ".join(map(str, cell)) if isinstance(cell, list)
+        else json.dumps(cell, ensure_ascii=False) if isinstance(cell, dict)
+        else cell
+        for cell in row
+    ]
 
 
 def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int = None,
@@ -42,6 +52,7 @@ def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int 
     if not sh:
         return 0
     try:
+        rows = [_normalize_row(row) for row in rows]
         try:
             ws = sh.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
@@ -80,7 +91,7 @@ def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int 
         print(f"  📊 {sheet_name}: {saved}개 저장")
         return saved
     except Exception as e:
-        print(f"  ⚠️ {sheet_name} 저장 실패: {e}")
+        print(f"  ⚠️ {sheet_name} 저장 실패: {safe_error(e)}")
         return 0
 
 
@@ -255,7 +266,7 @@ def get_videos_from_sheet(days_back=7):
 
 
 def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(config.KST).date().isoformat()
     g = gemini or {}
     c = comments or {}
     sentiment = c.get('sentiment', {}) if isinstance(c, dict) else {}
@@ -285,9 +296,9 @@ def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
         g.get('competitor_angle', ''),
         sentiment.get('positive', ''),
         sentiment.get('negative', ''),
-        ', '.join(c.get('praise_points', [])) if isinstance(c.get('praise_points'), list) else '',
-        ', '.join(c.get('complaints', [])) if isinstance(c.get('complaints'), list) else '',
-        ', '.join(c.get('next_video_requests', [])) if isinstance(c.get('next_video_requests'), list) else '',
+        c.get('praise_points', ''),
+        c.get('complaints', ''),
+        c.get('next_video_requests', ''),
         c.get('new_viewer_signals', ''),
         c.get('fan_engagement', ''),
         c.get('viral_signals', ''),
@@ -307,7 +318,7 @@ def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
             '신규시청자신호', '팬반응', '바이럴시그널', '재방문의사%', 'PPL반응', '크리에이터피드백',
             '댓글요약', 'URL',
         ],
-        [row], dedupe_col=2,
+        [row], dedupe_col=2, update_existing=has_text(g, "topic"),
     )
 
 

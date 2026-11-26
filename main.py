@@ -32,20 +32,47 @@ import trend_classifier as tc
 import strategy_scorer as scorer
 
 def validate_env(mode):
-    required = {
-        "YOUTUBE_API_KEY": config.YOUTUBE_API_KEY,
-        "TELEGRAM_BOT_TOKEN": config.TELEGRAM_BOT_TOKEN,
-        "TELEGRAM_CHAT_ID": config.TELEGRAM_CHAT_ID,
-    }
-    if config.TEXT_ANALYSIS_ENGINE == "deepseek":
-        required["DEEPSEEK_API_KEY"] = config.DEEPSEEK_API_KEY
+    if config.GEMINI_PROVIDER not in {"ai_studio", "vertexai"}:
+        print("❌ GEMINI_PROVIDER는 ai_studio 또는 vertexai이어야 합니다")
+        return False
     if config.TEXT_ANALYSIS_ENGINE not in {"gemini", "deepseek"}:
         print("❌ TEXT_ANALYSIS_ENGINE은 gemini 또는 deepseek이어야 합니다")
         return False
-    if mode in {"daily", "weekly", "trend", "trend-collect", "trend-weekly", "snapshot-collect"}:
-        required["SUPABASE_URL"] = config.SUPABASE_URL
-        required["SUPABASE_KEY"] = config.SUPABASE_KEY
+
+    youtube_modes = {
+        "daily", "own-channel", "initial-batch", "full-backfill", "comment-backfill",
+        "own-hourly", "own-track", "history-extend", "snapshot-collect", "stats-refresh",
+        "trend", "trend-collect", "b-track-init", "b-track-collect", "b-track-discover",
+        "b-track-run",
+    }
+    telegram_modes = {
+        "daily", "own-channel", "weekly", "initial-batch", "full-backfill", "comment-backfill",
+        "thumbnail-backfill", "own-hourly", "own-track", "score-backfill", "score-sheets-sync",
+        "history-extend", "trend", "trend-collect", "trend-weekly",
+    }
+    text_modes = {
+        "daily", "own-channel", "weekly", "initial-batch", "full-backfill",
+        "comment-backfill", "own-track", "history-extend",
+    }
+    gemini_modes = {
+        "daily", "own-channel", "initial-batch", "full-backfill", "thumbnail-backfill",
+        "history-extend", "b-track-discover",
+    }
+    required = {"SUPABASE_URL": config.SUPABASE_URL, "SUPABASE_KEY": config.SUPABASE_KEY}
+    if mode in youtube_modes:
+        required["YOUTUBE_API_KEY"] = config.YOUTUBE_API_KEY
+    if mode in telegram_modes:
+        required["TELEGRAM_BOT_TOKEN"] = config.TELEGRAM_BOT_TOKEN
+        required["TELEGRAM_CHAT_ID"] = config.TELEGRAM_CHAT_ID
+    if mode in text_modes and config.TEXT_ANALYSIS_ENGINE == "deepseek":
+        required["DEEPSEEK_API_KEY"] = config.DEEPSEEK_API_KEY
+    needs_gemini = mode in gemini_modes or (mode in text_modes and config.TEXT_ANALYSIS_ENGINE == "gemini")
+    if needs_gemini and config.GEMINI_PROVIDER == "ai_studio":
+        required["GEMINI_API_KEY"] = config.GEMINI_API_KEY
+
     missing = [key for key, value in required.items() if not value]
+    if mode in {"b-track-scan", "b-track-run"} and not (config.DEEPSEEK_API_KEY or config.GEMINI_API_KEY):
+        missing.append("DEEPSEEK_API_KEY 또는 GEMINI_API_KEY")
     if missing:
         print(f"❌ 누락된 환경변수: {', '.join(missing)}")
     return not missing
@@ -545,69 +572,86 @@ def run_own_channel_hourly_snapshot():
             )
 
 
-def run_own_channel_daily():
-    """자체 채널 새 영상 감지 + 즉시 분석 (숏츠 포함)"""
-    print(f"📺 자체 채널 분석 시작 ({datetime.now()})")
+def run_own_channel_daily() -> bool:
+    """자체 채널 새 영상 감지 및 분석 결과를 저장한다."""
+    now = datetime.now(config.KST)
+    print(f"📺 자체 채널 분석 시작 ({now})")
     start = time.time()
 
-    raw_videos, _ = yt.get_channel_videos(config.OWN_CHANNEL_ID, months_back=1)
-    if not raw_videos:
-        tg.send_message("📺 자체 채널: 영상 수집 실패")
-        return
-
-    video_ids = [v['video_id'] for v in raw_videos]
-    detailed = yt.get_video_details(video_ids, min_duration=0)  # 숏츠 포함
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    recent = [
-        v for v in detailed
-        if datetime.fromisoformat(v['published_at'].replace('Z', '+00:00')) > cutoff
-    ]
-
-    new_videos = [v for v in recent if not db.is_own_video_analyzed(v['video_id'])]
+    try:
+        raw_videos, channel_info = yt.get_channel_videos(config.OWN_CHANNEL_ID, months_back=1)
+        if not raw_videos and not channel_info:
+            raise RuntimeError("자체 채널 조회 결과 없음")
+        detailed = yt.get_video_details([v["video_id"] for v in raw_videos], min_duration=0) if raw_videos else []
+        cutoff = now - timedelta(days=7)
+        recent = [
+            video for video in detailed
+            if cutoff < datetime.fromisoformat(video["published_at"].replace("Z", "+00:00")) <= now
+        ]
+        new_videos = [v for v in recent if not db.is_own_video_analyzed(v["video_id"])]
+    except Exception as exc:
+        error = safe_error(exc)
+        print(f"❌ 자체 채널 수집 실패: {error}")
+        tg.send_error_alert(error, "자체 채널 수집")
+        return False
 
     if not new_videos:
         print("📭 새 영상 없음")
-        tg.send_message(f"📺 자체 채널: 새 영상 없음 ({datetime.now().strftime('%m/%d')})")
-        return
+        return tg.send_message(f"📺 자체 채널: 새 영상 없음 ({now:%m/%d})")
 
     print(f"📹 새 영상 {len(new_videos)}개 발견")
-
+    success = True
     for video in new_videos:
+        video_id = video["video_id"]
+        context = f"자체채널 - {video.get('title', '')[:30]}"
         try:
-            video['video_type'] = 'shorts' if yt.is_shorts(video) else 'longform'
-            vtype = '숏츠' if video['video_type'] == 'shorts' else '롱폼'
-            print(f"\n{'='*50}")
-            print(f"📹 [{vtype}] {video['title'][:50]}")
-
-            db.save_own_video(video)
+            video["video_type"] = "shorts" if yt.is_shorts(video) else "longform"
+            print(f"📹 {video['title'][:50]}")
+            if not db.save_own_video(video):
+                raise RuntimeError("자체 채널 영상 메타데이터 저장 실패")
 
             gemini_result = gemini.analyze_own_video(video)
-            print(f"  ✅ Gemini 분석 완료")
+            if not has_text(gemini_result, "topic"):
+                error = gemini_result.get("error") if isinstance(gemini_result, dict) else None
+                raise RuntimeError(error or "Gemini 분석에 필수 항목 topic 누락")
 
             comments_result = {}
-            if video.get('comment_count', 0) > 0:
-                comments = yt.get_video_comments(video['video_id'], max_comments=config.TOP_COMMENTS_COUNT)
-                if comments:
-                    comments_result = ds.analyze_own_video_comments(
-                        video['title'], comments, video['video_type']
+            if video.get("comment_count", 0) > 0:
+                try:
+                    comments = yt.get_video_comments(
+                        video_id, max_comments=config.TOP_COMMENTS_COUNT, raise_on_error=True,
                     )
-                    print(f"  ✅ 댓글 분석 완료")
-            else:
-                print(f"  ⚠️ 댓글 없음 - 댓글 분석 skip")
+                    if comments:
+                        comments_result = ds.analyze_own_video_comments(
+                            video["title"], comments, video["video_type"],
+                        )
+                        if not has_text(comments_result, "summary"):
+                            error = comments_result.get("error") if isinstance(comments_result, dict) else None
+                            raise RuntimeError(error or "댓글 분석에 필수 항목 summary 누락")
+                except Exception as exc:
+                    error = safe_error(exc)
+                    print(f"  ⚠️ 댓글 분석 실패 ({video_id}): {error}")
+                    comments_result = {"error": error}
+                    tg.send_error_alert(error, f"{context} 댓글")
+                    success = False
 
-            db.save_own_analysis(video['video_id'], gemini_result, comments_result)
+            if not db.save_own_analysis(video_id, gemini_result, comments_result):
+                raise RuntimeError("자체 채널 분석 저장 실패")
             sheets.save_own_analysis(video, gemini_result, comments_result)
-            tg.send_own_channel_alert(video, gemini_result, comments_result)
+            if not tg.send_own_channel_alert(video, gemini_result, comments_result):
+                raise RuntimeError("자체 채널 분석 알림 전송 실패")
             time.sleep(3)
 
-        except Exception as e:
-            print(f"❌ 영상 분석 실패 ({video.get('video_id', '')}): {e}")
-            traceback.print_exc()
-            tg.send_error_alert(str(e), f"자체채널 - {video.get('title', '')[:30]}")
+        except Exception as exc:
+            error = safe_error(exc)
+            print(f"❌ 영상 처리 실패 ({video_id}): {error}")
+            tg.send_error_alert(error, context)
+            success = False
 
     duration = time.time() - start
-    print(f"✅ 자체 채널 분석 완료 ({duration/60:.1f}분)")
+    status = "완료" if success else "실패 포함"
+    print(f"자체 채널 분석 {status} ({duration / 60:.1f}분)")
+    return success
 
 
 # ───────────────────────────────────────────────
@@ -1394,6 +1438,37 @@ def run_weekly_report():
 # 진입점
 # ───────────────────────────────────────────────
 
+def run_b_track(mode, args) -> bool:
+    try:
+        if mode in {"b-track-init", "b-track-collect", "b-track-run"}:
+            import b_track_collector
+
+            if mode == "b-track-init":
+                b_track_collector.init_seed_sources()
+            else:
+                b_track_collector.run_collect()
+        if mode in {"b-track-scan", "b-track-cluster", "b-track-run"}:
+            import b_track_gemini
+
+            if mode != "b-track-cluster":
+                b_track_gemini.run_broad_scan()
+            if mode != "b-track-scan":
+                b_track_gemini.run_cluster()
+        if mode == "b-track-score":
+            import b_track_scorer
+
+            max_entities = int(args[0]) if args else 500
+            b_track_scorer.run_score(max_entities=max_entities)
+        if mode == "b-track-discover":
+            import b_track_discovery
+
+            b_track_discovery.run_discovery()
+    except Exception as exc:
+        print(f"❌ {mode} 실패: {safe_error(exc)}")
+        return False
+    return True
+
+
 if __name__ == "__main__":
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", line_buffering=True)
@@ -1425,7 +1500,7 @@ if __name__ == "__main__":
     elif mode == "own-hourly":
         run_own_channel_hourly_snapshot()
     elif mode == "own-channel":
-        run_own_channel_daily()
+        sys.exit(0 if run_own_channel_daily() else 1)
     elif mode == "own-track":
         run_own_channel_track()
     elif mode == "own-backfill":
@@ -1449,6 +1524,11 @@ if __name__ == "__main__":
         run_history_extend(extra_months=months)
     elif mode == "comment-backfill":
         run_comment_backfill()
+    elif mode in {
+        "b-track-init", "b-track-collect", "b-track-scan", "b-track-cluster",
+        "b-track-score", "b-track-discover", "b-track-run",
+    }:
+        sys.exit(0 if run_b_track(mode, sys.argv[2:]) else 1)
     # 구버전 호환
     elif mode == "trend":
         print("⚠️ 'trend' → 'trend-collect'로 실행됩니다")

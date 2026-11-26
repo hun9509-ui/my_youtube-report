@@ -257,7 +257,7 @@ def send_irregular_alert(video: dict):
     return send_message(msg)
  
  
-def send_own_channel_alert(video: dict, gemini: dict, comments: dict):
+def send_own_channel_alert(video: dict, gemini: dict, comments: dict) -> bool:
     """자체 채널 새 영상 분석 알림"""
     g = gemini or {}
     c = comments or {}
@@ -266,34 +266,34 @@ def send_own_channel_alert(video: dict, gemini: dict, comments: dict):
 
     msg = (
         f"{emoji} <b>[자체채널 {vtype}] 새 영상 분석</b>\n\n"
-        f"📌 <b>{video.get('title', '')}</b>\n"
-        f"📅 업로드: {str(video.get('published_at', ''))[:10]}\n"
+        f"📌 <b>{escape(str(video.get('title', '')))}</b>\n"
+        f"📅 업로드: {escape(str(video.get('published_at', ''))[:10])}\n"
         f"👁 초기 조회수: {video.get('view_count', 0):,}회\n\n"
         f"🎯 <b>콘텐츠 분석</b>\n"
-        f"  주제: {g.get('topic', '')}\n"
-        f"  구조: {g.get('content_structure', '')}\n"
-        f"  성과 예측: {g.get('predicted_performance', '')} — {g.get('predicted_performance_reason', '')[:80]}\n"
-        f"  강점: {g.get('strengths', '')[:120]}\n"
-        f"  개선: {g.get('improvement_points', '')[:120]}\n"
+        f"  주제: {escape(g.get('topic', ''))}\n"
+        f"  구조: {escape(g.get('content_structure', ''))}\n"
+        f"  성과 예측: {escape(g.get('predicted_performance', ''))} — {escape(g.get('predicted_performance_reason', '')[:80])}\n"
+        f"  강점: {escape(g.get('strengths', '')[:120])}\n"
+        f"  개선: {escape(g.get('improvement_points', '')[:120])}\n"
     )
 
     if g.get('thumbnail_suggestion') and g.get('thumbnail_suggestion') != '없음':
-        msg += f"  썸네일: {g.get('thumbnail_suggestion', '')[:80]}\n"
+        msg += f"  썸네일: {escape(g.get('thumbnail_suggestion', '')[:80])}\n"
 
     if c and 'summary' in c:
         msg += (
             f"\n💬 <b>댓글 여론</b>\n"
-            f"  {c.get('summary', '')}\n"
-            f"  피드백: {c.get('creator_feedback', '')[:150]}\n"
+            f"  {escape(c.get('summary', ''))}\n"
+            f"  피드백: {escape(str(c.get('creator_feedback') or '')[:150])}\n"
         )
-        reqs = c.get('next_video_requests', [])
-        if reqs:
+        reqs = c.get('next_video_requests')
+        if isinstance(reqs, list) and reqs:
             msg += "\n📝 <b>다음 영상 요청</b>\n"
             for req in reqs[:3]:
-                msg += f"  • {req}\n"
+                msg += f"  • {escape(str(req))}\n"
 
-    msg += f"\n🔗 {video.get('video_url', '')}"
-    send_message(msg)
+    msg += f"\n🔗 {escape(str(video.get('video_url', '')))}"
+    return send_message(msg)
 
 
 def send_own_tracking_summary(results: list):
