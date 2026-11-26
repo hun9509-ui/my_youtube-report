@@ -240,10 +240,13 @@ def _extract_json_list(text: str) -> list:
 
 def stage3_classify(facts: dict) -> dict:
     """Gemini로 채널별 분류/점수. facts에 분류결과 병합."""
+    for fact in facts.values():
+        fact.pop('_classified', None)
+
     try:
         import gemini_analyzer as ga
         generate_text = ga.genai_generate_text
-    except (ImportError, AttributeError) as e:
+    except Exception as e:
         print(f"  단계3: Gemini 초기화 실패: {_safe_error(e)}")
         return facts
     ids = list(facts.keys())
@@ -265,21 +268,25 @@ def stage3_classify(facts: dict) -> dict:
             results = _extract_json_list(generate_text(prompt))
             if not isinstance(results, list):
                 raise ValueError("채널 분류 응답은 JSON 객체 배열이어야 합니다")
+            classifications = {}
             for r in results:
                 cid = r.get('channel_id')
                 if cid in batch_ids:
-                    facts[cid].update({
+                    classifications[cid] = {
                         'primary_category': r.get('primary_category', 'other'),
                         'seed_fitness_score': float(r.get('seed_fitness_score', 0)),
                         'gender_scope': r.get('gender_scope', 'unisex'),
                         'is_vlog_jumble': bool(r.get('is_vlog_jumble', False)),
                         'gemini_reason': r.get('reason', ''),
-                    })
+                        '_classified': True,
+                    }
         except Exception as e:
             print(f"  단계3: Gemini 배치 {i//batch_size+1} 실패: {_safe_error(e)}")
             continue
 
-        print(f"  단계3: Gemini 분류 배치 {i//batch_size+1} ({len(batch_ids)}개)")
+        for cid, fields in classifications.items():
+            facts[cid].update(fields)
+        print(f"  단계3: Gemini 분류 배치 {i//batch_size+1} ({len(classifications)}/{len(batch_ids)}개)")
         time.sleep(1)
 
     return facts
@@ -290,12 +297,10 @@ def stage3_classify(facts: dict) -> dict:
 # ─────────────────────────────────────────────
 def stage4_save_and_report(db, facts: dict):
     """trend_source_candidates에 upsert (status='candidate'). 표 출력. 등록 안 함."""
-    if not facts:
-        print("  단계4: 후보 없음")
-        return
-
     rows = []
     for cid, f in facts.items():
+        if f.get('_classified') is not True:
+            continue
         # 발굴 경로 수 = 가산점 (여러 키워드/경로에서 중복 등장)
         hit_count = len(f.get('paths', []))
         rows.append({
@@ -316,6 +321,10 @@ def stage4_save_and_report(db, facts: dict):
             'status': 'candidate',
             'last_scored_at': datetime.now(timezone.utc).isoformat(),
         })
+
+    if not rows:
+        print("  단계4: 분류 성공 후보 없음")
+        return
 
     for i in range(0, len(rows), 100):
         db.table('trend_source_candidates').upsert(rows[i:i+100]).execute()
