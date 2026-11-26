@@ -1,7 +1,7 @@
 """모델 응답을 DB 저장과 텔레그램 출력 전에 검증한다."""
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 
 RequiredText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -24,6 +24,29 @@ class VideoAnalysis(AnalysisOutput):
     success_factors: str = ""
     applicability: str = ""
     applicability_reason: str = ""
+
+
+class OwnVideoAnalysis(VideoAnalysis):
+    content_structure: str = ""
+    title_emotion_tone: str = ""
+    unique_differentiator: str = ""
+    predicted_performance: str = ""
+    predicted_performance_reason: str = ""
+    strengths: str = ""
+    improvement_points: str = ""
+    thumbnail_suggestion: str = ""
+    competitor_angle: str = ""
+
+    @field_validator(
+        "content_structure", "title_emotion_tone", "unique_differentiator",
+        "predicted_performance", "predicted_performance_reason", "strengths",
+        "improvement_points", "thumbnail_suggestion", "competitor_angle", mode="before",
+    )
+    @classmethod
+    def join_text_items(cls, value):
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return ", ".join(value)
+        return value
 
 
 class CommentAnalysis(AnalysisOutput):

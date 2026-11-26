@@ -14,7 +14,8 @@ from gemini_client import generate_json, RETRYABLE_STATUS_CODES, safe_error
 
 def _call_gemini_text(prompt: str, retry: int = 3) -> dict:
     full_prompt = "당신은 한국 유튜브 콘텐츠 분석 전문가입니다. 항상 JSON 형식으로만 응답하세요.\n\n" + prompt
-    return generate_json(full_prompt, config.get_gemini_model("text"), attempts=retry)
+    return generate_json(full_prompt, config.get_gemini_model("text"), attempts=retry,
+                         fallback_models=config.get_gemini_fallback_models("text"))
 
 
 def _call_deepseek_api(prompt: str, complex_task: bool = False, retry: int = 3) -> dict:
@@ -55,6 +56,47 @@ def _call_deepseek_api(prompt: str, complex_task: bool = False, retry: int = 3) 
             if not retryable or attempt >= retry:
                 return {"error": error, **metadata}
             time.sleep(min(2 ** attempt, 15))
+
+
+def call_deepseek_raw(prompt: str, complex_task: bool = False, retry: int = 2) -> str:
+    """DeepSeek 원문 응답을 반환한다. 최종 실패 시 빈 문자열을 반환한다."""
+    from openai import APIConnectionError, APIStatusError, OpenAI
+
+    if not config.DEEPSEEK_API_KEY:
+        print("  ⚠️ DEEPSEEK_API_KEY 미설정")
+        return ""
+    model = config.get_deepseek_model(complex_task=complex_task)
+    attempts = max(1, retry)
+    try:
+        with OpenAI(api_key=config.DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                    max_retries=0, timeout=90) as client:
+            for attempt in range(1, attempts + 1):
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "당신은 한국 유튜브 콘텐츠 분석 전문가입니다. 지시된 JSON 형식으로만 응답하세요."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.3,
+                    )
+                    content = response.choices[0].message.content
+                    if not content:
+                        raise ValueError("DeepSeek 응답 텍스트 없음")
+                    return content
+                except APIStatusError as exc:
+                    retryable = exc.status_code in RETRYABLE_STATUS_CODES
+                    error = safe_error(exc)
+                except (APIConnectionError, ValueError, IndexError) as exc:
+                    retryable = True
+                    error = safe_error(exc)
+                print(f"  ⚠️ DeepSeek raw ({attempt}/{attempts}): {error}")
+                if not retryable or attempt == attempts:
+                    break
+                time.sleep(min(2 ** attempt, 8))
+    except Exception as exc:
+        print(f"  ⚠️ DeepSeek raw 실패: {safe_error(exc)}")
+    return ""
 
 
 def call_deepseek(prompt, complex_task=False, retry=3):

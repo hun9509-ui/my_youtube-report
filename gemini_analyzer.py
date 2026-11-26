@@ -1,11 +1,12 @@
-"""Vertex AI를 이용한 영상, 썸네일, 트렌드 분석."""
+"""Gemini를 이용한 영상, 썸네일, 트렌드 분석."""
 import base64
 import time
 
 import requests
 
 import config
-from analysis_schema import VideoAnalysis
+from analysis_schema import OwnVideoAnalysis, VideoAnalysis
+import gemini_client
 from gemini_client import generate_json, safe_error
 
 
@@ -46,9 +47,9 @@ ANALYSIS_PROMPT = """
 """
 
 
-def analyze_video(video_data, model_name=None, retry=3):
+def analyze_video(video_data, model_name=None, retry=3, *, model_mode="daily"):
     """단일 영상 분석"""
-    model_name = model_name or config.get_gemini_model('daily')
+    model_name = model_name or config.get_gemini_model(model_mode)
     prompt = ANALYSIS_PROMPT.format(
         title=video_data.get('title', ''),
         channel=video_data.get('channel_title', ''),
@@ -60,20 +61,21 @@ def analyze_video(video_data, model_name=None, retry=3):
         duration=video_data.get('duration', '')
     )
 
-    result = generate_json(prompt, model_name, attempts=retry, response_model=VideoAnalysis)
+    result = generate_json(prompt, model_name, attempts=retry, response_model=VideoAnalysis,
+                           fallback_models=config.get_gemini_fallback_models(model_mode))
     return {**result, "video_id": video_data.get("video_id", "")}
 
 
 def analyze_videos_batch(videos, delay=5, model_mode='daily'):
     """여러 영상 배치 분석"""
     model_name = config.get_gemini_model(model_mode)
-    print(f"  🤖 Gemini 모델: {model_name} (Vertex AI)")
+    print(f"  🤖 Gemini 모델: {model_name} ({config.GEMINI_PROVIDER})")
     results = []
     errors = 0
 
     for i, video in enumerate(videos):
         print(f"  분석 중 ({i+1}/{len(videos)}): {video.get('title', '')[:45]}")
-        result = analyze_video(video, model_name=model_name)
+        result = analyze_video(video, model_name=model_name, model_mode=model_mode)
         if 'error' in result:
             errors += 1
             print(f"    ❌ 실패: {result['error']}")
@@ -103,6 +105,7 @@ OWN_CHANNEL_PROMPT = """
   "content_structure": "브이로그형/정보전달형/스토리텔링형/리뷰형/토크형",
   "title_pattern": "질문형/단정형/숫자형/감정형/정보형",
   "title_emotion_tone": "따뜻함/놀람/친근함/권위감/유머/공감/기대감",
+  "unique_differentiator": "이 영상만의 차별점",
   "hook_strategy": "시청자를 끌어들이는 전략",
   "ppl_likely": "PPL 가능성 있으면 true, 없으면 false",
   "ppl_signals": "PPL 근거 (없으면 빈 문자열)",
@@ -133,7 +136,8 @@ def analyze_own_video(video_data, retry=3):
         views=video_data.get('view_count', 0),
     )
 
-    result = generate_json(prompt, model_name, attempts=retry, response_model=VideoAnalysis)
+    result = generate_json(prompt, model_name, attempts=retry, response_model=OwnVideoAnalysis,
+                           fallback_models=config.get_gemini_fallback_models("daily"))
     return {**result, "video_id": video_data.get("video_id", "")}
 
 
@@ -184,7 +188,8 @@ def analyze_thumbnail(thumbnail_url: str, video_data: dict, retry: int = 3) -> d
     except (requests.RequestException, ValueError) as exc:
         return {"video_id": video_id, "error": safe_error(exc), "model_used": model_name}
 
-    result = generate_json(prompt, model_name, attempts=retry, image=image, required_field="main_emotion")
+    result = generate_json(prompt, model_name, attempts=retry, image=image, required_field="main_emotion",
+                           fallback_models=config.get_gemini_fallback_models("vision"))
     return {**result, "video_id": video_id, "model_used": result.get("_model_version", model_name)}
 
 
@@ -216,4 +221,16 @@ def detect_daily_trends(trending_videos):
 JSON만 반환하세요.
 """
 
-    return generate_json(prompt, config.get_gemini_model("daily"), required_field="summary")
+    return generate_json(prompt, config.get_gemini_model("daily"), required_field="summary",
+                         fallback_models=config.get_gemini_fallback_models("daily"))
+
+
+def genai_generate_text_with_meta(prompt: str, model_name: str = None) -> tuple[str, str]:
+    model = model_name or config.get_gemini_model("btrack")
+    fallbacks = config.get_gemini_fallback_models("btrack")
+    return gemini_client.generate_text(prompt, model, fallback_models=fallbacks)
+
+
+def genai_generate_text(prompt: str, model_name: str = None) -> str:
+    text, _ = genai_generate_text_with_meta(prompt, model_name=model_name)
+    return text

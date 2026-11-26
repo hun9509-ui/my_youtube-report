@@ -59,17 +59,35 @@ SCORE_VERSION = "v1.2"    # 전략 스코어링 버전
 INITIAL_MONTHS = 6
 TOP_COMMENTS_COUNT = 200
 TRENDING_VIDEOS_COUNT = 50
+SHORTS_MAX_SECONDS = 180
 DAILY_LOOKBACK_DAYS = 7
 
 # ===== Gemini 모델 =====
 # TEXT_ANALYSIS_ENGINE: "gemini" | "deepseek"
 # "gemini"로 설정하면 deepseek_processor의 모든 분석이 Gemini로 라우팅됨
-TEXT_ANALYSIS_ENGINE = os.getenv("TEXT_ANALYSIS_ENGINE", "gemini").strip().lower()
+GEMINI_PROVIDER = os.getenv("GEMINI_PROVIDER", "ai_studio").strip().lower()
+TEXT_ANALYSIS_ENGINE = os.getenv("TEXT_ANALYSIS_ENGINE", "deepseek").strip().lower()
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().upper()
+
 
 def get_gemini_model(mode='daily'):
     """용도별 모델을 개별 환경변수로 변경할 수 있다."""
-    default = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    if mode in ('btrack', 'free'):
+        return os.getenv("GEMINI_BTRACK_MODEL", "gemini-3.5-flash-lite")
+    default = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen")
     return os.getenv(f"GEMINI_{mode.upper()}_MODEL", default)
+
+
+def get_gemini_fallback_models(mode='daily') -> list[str]:
+    configured = os.getenv("GEMINI_FALLBACK_MODELS")
+    if configured is not None:
+        models = [model.strip() for model in configured.split(",")]
+    elif mode in ('btrack', 'free'):
+        models = ["gemini-2.5-flash-lite"]
+    else:
+        models = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite"]
+    primary = get_gemini_model(mode)
+    return [model for model in dict.fromkeys(models) if model and model != primary]
 
 # ===== 대박 영상 기준 =====
 HIT_VIDEO_MULTIPLIER = 2.0  # 채널 평균 조회수 × 2배 이상
