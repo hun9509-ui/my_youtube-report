@@ -192,6 +192,8 @@ def detect_irregular(video: dict) -> dict:
         return {"is_irregular": False, "reasons": [], "metrics": {}}
 
     now = datetime.now(timezone.utc)
+    if upload_time.tzinfo is None or upload_time > now:
+        return {"is_irregular": False, "reasons": [], "metrics": {}}
     hours_since_upload = max((now - upload_time).total_seconds() / 3600, 0.1)
     views_per_hour = view_count / hours_since_upload
 

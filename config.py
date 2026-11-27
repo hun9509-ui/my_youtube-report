@@ -2,7 +2,9 @@
 한고은 채널 분석 시스템 - 설정 파일
 """
 import os
-from datetime import datetime
+from datetime import timedelta, timezone
+
+KST = timezone(timedelta(hours=9), name="KST")
 
 # ===== API 키 =====
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
@@ -19,29 +21,38 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ===== Google Cloud (Vertex AI) =====
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "totemic-courage-495009-h4")
-GOOGLE_CLOUD_LOCATION = "global"
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
 # ===== 분석 대상 채널 =====
 TARGET_CHANNELS = {
-    "안녕하세요 최화정이에요": "UCIQQC0T_yj-pXoXRk5vaOAw",
+    "안녕하세요 최화정이에요": "UCA9kvKQdNxslWm5IKZgXS_A",
     "이민정 MJ": "UCFNUGAiaGRgzVCXrjVoe1Hw",
     "자유부인 한가인": "UCvnVUhn95YfQazC_bc2lU6w",
     "깡주은": "UCcjmCG5tTegWwqcSDSkDevQ",
     "고소영": "UCag6Qu6uHjQKPvBI5MW12AQ",
-    "한지혜 Han Ji Hye": "UC1vQa5Pbtt-uewHSxUPc8rA",
+    "한지혜 Han Ji Hye": "UCfcEEsjr6_lUUHQ-1zID2cQ",
     "밉지않은 관종언니": "UCtkRVaUSpkuhqdKv39oBXKA",
     "A급 장영란": "UCfVWxOKzPwSZkEcxXmrH6yw",
     "공부왕찐천재 홍진경": "UCkxbPwdaV74Erdxt97Nt23w",
-    "개과천선 서인영": "UCAMGWbOnDd9dpAK7BO0Wftw"
+    "개과천선 서인영": "UCAMGWbOnDd9dpAK7BO0Wftw",
+    "김나영의 nofilterTV": "UC0wNauoCVIfU_xtWwrczFiA",
+    "순풍 선우용여": "UCjJhHk-vpe59lCR5f4YalTQ",
+    "채정안TV": "UCktGIKibxR7agzlF62Mbx2A",
+    "신애라이프": "UCnnJ34afyg9w25I_AVZIHxA",
+    "Umaizing 엄정화TV": "UC6le2DAXq9bLVVYl6nenbEg",
+    "황신혜의 cine style": "UCrQ-eA1UWgv0TJBkbO-y13Q",
 }
 
-# ===== 초기 수집 배치 분할 (가나다순) =====
+# ===== 초기 수집 배치 분할 =====
 INITIAL_BATCHES = {
     1: ["개과천선 서인영", "고소영"],
     2: ["깡주은", "공부왕찐천재 홍진경"],
     3: ["밉지않은 관종언니", "안녕하세요 최화정이에요"],
     4: ["이민정 MJ", "A급 장영란"],
     5: ["자유부인 한가인", "한지혜 Han Ji Hye"],
+    6: ["김나영의 nofilterTV", "순풍 선우용여"],
+    7: ["채정안TV", "신애라이프"],
+    8: ["Umaizing 엄정화TV", "황신혜의 cine style"],
 }
 
 # ===== 자체 채널 =====
@@ -50,37 +61,50 @@ OWN_CHANNEL_ID = "UCPFW9tE-hAuyR4037csZAqg"
 OWN_CHANNEL_TRACKING_WEEKS = 5  # 업로드 후 5주 월요일까지 추적
 
 # ===== 분석 버전 =====
-ANALYSIS_VERSION = "1.1"  # 프롬프트/모델 기준 버전 (데이터 추적용)
-SCORE_VERSION = "v1.2"    # 전략 스코어링 버전
+ANALYSIS_VERSION = "1.2"  # 검증된 응답 및 모델 버전 기록
+SCORE_VERSION = "v2.0"    # 전략 스코어링 버전
 
 # ===== 분석 설정 =====
 INITIAL_MONTHS = 6
 TOP_COMMENTS_COUNT = 200
 TRENDING_VIDEOS_COUNT = 50
+SHORTS_MAX_SECONDS = 180
+DAILY_LOOKBACK_DAYS = 7
 
 # ===== Gemini 모델 =====
 # TEXT_ANALYSIS_ENGINE: "gemini" | "deepseek"
 # "gemini"로 설정하면 deepseek_processor의 모든 분석이 Gemini로 라우팅됨
-TEXT_ANALYSIS_ENGINE = "gemini"
+GEMINI_PROVIDER = os.getenv("GEMINI_PROVIDER", "ai_studio").strip().lower()
+TEXT_ANALYSIS_ENGINE = os.getenv("TEXT_ANALYSIS_ENGINE", "deepseek").strip().lower()
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().upper()
+
 
 def get_gemini_model(mode='daily'):
-    """mode: 'initial' | 'daily' | 'free' | 'vision' | 'text'"""
-    if mode == 'free':
-        return "gemini-2.0-flash-001"
-    if mode in ('vision', 'text'):
-        return "gemini-3.1-pro-preview"
-    return "gemini-2.5-flash"
+    """용도별 모델을 개별 환경변수로 변경할 수 있다."""
+    if mode in ('btrack', 'free'):
+        return os.getenv("GEMINI_BTRACK_MODEL", "gemini-3.5-flash-lite")
+    default = os.getenv("GEMINI_MODEL", "gemini-4-hydrogen")
+    return os.getenv(f"GEMINI_{mode.upper()}_MODEL", default)
+
+
+def get_gemini_fallback_models(mode='daily') -> list[str]:
+    configured = os.getenv("GEMINI_FALLBACK_MODELS")
+    if configured is not None:
+        models = [model.strip() for model in configured.split(",")]
+    elif mode in ('btrack', 'free'):
+        models = ["gemini-2.5-flash-lite"]
+    else:
+        models = ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
+    primary = get_gemini_model(mode)
+    return [model for model in dict.fromkeys(models) if model and model != primary]
 
 # ===== 대박 영상 기준 =====
 HIT_VIDEO_MULTIPLIER = 2.0  # 채널 평균 조회수 × 2배 이상
 
 # ===== DeepSeek 모델 =====
-DEEPSEEK_DISCOUNT_END = datetime(2026, 5, 31, 23, 59)
-
 def get_deepseek_model(complex_task=False):
-    if complex_task and datetime.now() < DEEPSEEK_DISCOUNT_END:
-        return "deepseek-v4-pro"
-    return "deepseek-v4-flash"
+    default = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    return os.getenv("DEEPSEEK_COMPLEX_MODEL", default) if complex_task else default
 
 # ===== 구글 시트 탭 이름 =====
 SHEET_VIDEOS = "영상_마스터데이터"

@@ -1,5 +1,28 @@
 # 한고은 채널 분석 시스템
 
+## 분석 엔진 개선 브랜치
+
+- `pip install -r requirements.txt`로 의존성을 설치합니다. 검증 DB에 `DATABASE_URL`을 설정하고 `python db_migrate.py`를 실행합니다. 기존 행을 보존하면서 네 테이블에 `processing_key`를 추가하고 B-track 점수 및 답변 카드 테이블을 준비합니다.
+- Gemini 기본 제공자는 Google AI Studio(`GEMINI_PROVIDER=ai_studio`)입니다. `GEMINI_API_KEY`를 환경변수에 설정하면 요청 헤더로 인증합니다. `GEMINI_PROVIDER=vertexai`를 선택하면 Google Cloud ADC와 `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`을 사용합니다.
+- A-track Gemini 기본 모델은 `gemini-4-hydrogen`이며, 기본 폴백 순서는 `gemini-3.8-flash` → `gemini-3.5-flash` → `gemini-2.5-flash-lite`입니다. `GEMINI_MODEL`과 용도별 `GEMINI_DAILY_MODEL`, `GEMINI_INITIAL_MODEL`, `GEMINI_TEXT_MODEL`, `GEMINI_VISION_MODEL`로 주 모델을 지정합니다. `GEMINI_FALLBACK_MODELS`에는 쉼표로 구분한 폴백 모델을, `GEMINI_THINKING_LEVEL`에는 사용할 사고 수준을 설정할 수 있습니다.
+- 댓글·주간 텍스트 분석의 기본 엔진은 DeepSeek(`TEXT_ANALYSIS_ENGINE=deepseek`)입니다. `DEEPSEEK_API_KEY`를 설정하고 필요에 따라 `DEEPSEEK_MODEL`, `DEEPSEEK_COMPLEX_MODEL`로 모델을 지정합니다. 텍스트 분석도 Gemini로 실행하려면 `TEXT_ANALYSIS_ENGINE=gemini`로 설정합니다.
+- `daily`는 최근 7일 후보를 확인해 유효한 기존 분석을 재사용합니다. `own-channel`은 유효한 Gemini 분석만 저장하며, 댓글 분석이 실패해도 Gemini 결과는 저장하고 종료 코드 1을 반환합니다.
+- 로컬 A-track 회귀 검증은 `python -m unittest tests/test_pipeline.py -v`로 실행합니다. 테스트가 네트워크 호출을 대체합니다.
+
+### B-track 실행
+
+| 명령 | 작업 |
+| --- | --- |
+| `python main.py b-track-init` | 시드 채널 등록 |
+| `python main.py b-track-collect` | 시드 채널의 영상 메타데이터 수집 |
+| `python main.py b-track-scan` | 미분석 영상 브로드 스캔 |
+| `python main.py b-track-cluster` | 엔티티 멘션을 트렌드 클러스터로 집계 |
+| `python main.py b-track-score [최대 엔티티 수]` | 엔티티 점수와 답변 카드 생성. 기본 500개 |
+| `python main.py b-track-discover` | 시드 후보 채널 발굴 및 분류 |
+| `python main.py b-track-run` | 수집 → 스캔 → 클러스터 순차 실행 |
+
+B-track에는 `SUPABASE_URL`과 `SUPABASE_KEY`가 필요합니다. 시드 등록, 수집, 발굴, 통합 실행에는 `YOUTUBE_API_KEY`도 필요합니다. 스캔과 통합 실행에는 `DEEPSEEK_API_KEY` 또는 `GEMINI_API_KEY`가 필요하며, AI Studio로 발굴 후보를 분류할 때는 `GEMINI_API_KEY`가 필요합니다. B-track Gemini 기본 모델은 `gemini-3.5-flash-lite`이고 기본 폴백은 `gemini-2.5-flash-lite`입니다. 주 모델은 `GEMINI_BTRACK_MODEL`로 지정합니다.
+
 ## 📋 시스템 개요
 
 YouTube 경쟁 채널 자동 분석 + 트렌드 모니터링 + 텔레그램 알림 시스템

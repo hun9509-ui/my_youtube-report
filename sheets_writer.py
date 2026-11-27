@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 import config
+from gemini_client import has_text, safe_error
 
 
 _sh = None
@@ -29,18 +30,29 @@ def _get_sheet():
         _sh = gspread.authorize(creds).open_by_key(config.GOOGLE_SHEET_ID)
         return _sh
     except Exception as e:
-        print(f"  ⚠️ 스프레드시트 초기화 실패: {e}")
+        print(f"  ⚠️ 스프레드시트 초기화 실패: {safe_error(e)}")
         return None
 
 
-def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int = None) -> int:
-    """탭에 행 추가. dedupe_col 지정 시 해당 컬럼 기준 중복 제거"""
+def _normalize_row(row):
+    return [
+        ", ".join(map(str, cell)) if isinstance(cell, list)
+        else json.dumps(cell, ensure_ascii=False) if isinstance(cell, dict)
+        else cell
+        for cell in row
+    ]
+
+
+def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int = None,
+                    update_existing: bool = False) -> int:
+    """탭에 행을 추가하고, 필요하면 기존 키에 해당하는 행을 갱신한다."""
     if not rows:
         return 0
     sh = _get_sheet()
     if not sh:
         return 0
     try:
+        rows = [_normalize_row(row) for row in rows]
         try:
             ws = sh.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
@@ -55,23 +67,31 @@ def _write_to_sheet(sheet_name: str, headers: list, rows: list, dedupe_col: int 
 
         if dedupe_col is not None:
             seen = {
-                row[dedupe_col]
-                for row in existing[1:]
+                row[dedupe_col]: row_number
+                for row_number, row in enumerate(existing[1:], 2)
                 if len(row) > dedupe_col and row[dedupe_col]
             }
-            new_rows = [r for r in rows if len(r) > dedupe_col and str(r[dedupe_col]) not in seen]
+            unique = {str(row[dedupe_col]): row for row in rows if len(row) > dedupe_col}
+            new_rows = [row for key, row in unique.items() if key not in seen]
         else:
             new_rows = rows
 
-        if not new_rows:
-            print(f"  ⏩ {sheet_name}: 신규 없음")
-            return 0
-
-        ws.append_rows(new_rows, value_input_option='USER_ENTERED')
-        print(f"  📊 {sheet_name}: {len(new_rows)}개 저장")
-        return len(new_rows)
+        updates = []
+        if update_existing and dedupe_col is not None:
+            for key, row in unique.items():
+                if key in seen:
+                    row_number = seen[key]
+                    end = gspread.utils.rowcol_to_a1(row_number, len(row))
+                    updates.append({"range": f"A{row_number}:{end}", "values": [row]})
+        if updates:
+            ws.batch_update(updates, value_input_option="RAW")
+        if new_rows:
+            ws.append_rows(new_rows, value_input_option="RAW")
+        saved = len(updates) + len(new_rows)
+        print(f"  📊 {sheet_name}: {saved}개 저장")
+        return saved
     except Exception as e:
-        print(f"  ⚠️ {sheet_name} 저장 실패: {e}")
+        print(f"  ⚠️ {sheet_name} 저장 실패: {safe_error(e)}")
         return 0
 
 
@@ -151,13 +171,15 @@ def save_initial_analysis(analyses, batch_num):
     )
 
 
-def save_daily_analysis(analyses):
-    today = datetime.now().strftime('%Y-%m-%d')
-    rows = [_build_analysis_row(a, [today]) for a in analyses]
+def save_daily_analysis(analyses, analysis_date=None):
+    today = (analysis_date or datetime.now(config.KST).date()).isoformat()
+    rows = [_build_analysis_row(a, [a.get("analysis_date", today)]) for a in analyses]
     return _write_to_sheet(
         config.SHEET_DAILY,
         ['분석일'] + _ANALYSIS_HEADERS_BASE,
         rows,
+        dedupe_col=1,
+        update_existing=True,
     )
 
 
@@ -201,8 +223,8 @@ def save_daily_trends(trends_data):
     )
 
 
-def save_weekly_report(report):
-    today = datetime.now().strftime('%Y-%m-%d')
+def save_weekly_report(report, report_date=None):
+    today = (report_date or datetime.now(config.KST).date()).isoformat()
     row = [
         today, report.get('week_summary', ''),
         json.dumps(report.get('top_performing_channels', []), ensure_ascii=False),
@@ -216,6 +238,8 @@ def save_weekly_report(report):
         config.SHEET_WEEKLY,
         ['날짜', '주간요약', '잘나가는채널', '떠오르는주제', '포맷트렌드', 'PPL관찰', '한고은액션', '다음영상방향성'],
         [row],
+        dedupe_col=0,
+        update_existing=True,
     )
 
 
@@ -237,12 +261,12 @@ def get_videos_from_sheet(days_back=7):
             .in_('video_id', video_ids).execute()
         return [{'채널명': v['channel_title'], '제목': v['title'], '조회수': v['view_count']} for v in vids.data]
     except Exception as e:
-        print(f"  ⚠️ 최근 영상 조회 실패: {e}")
+        print(f"  ⚠️ 최근 영상 조회 실패: {safe_error(e)}")
         return []
 
 
 def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(config.KST).date().isoformat()
     g = gemini or {}
     c = comments or {}
     sentiment = c.get('sentiment', {}) if isinstance(c, dict) else {}
@@ -272,9 +296,9 @@ def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
         g.get('competitor_angle', ''),
         sentiment.get('positive', ''),
         sentiment.get('negative', ''),
-        ', '.join(c.get('praise_points', [])) if isinstance(c.get('praise_points'), list) else '',
-        ', '.join(c.get('complaints', [])) if isinstance(c.get('complaints'), list) else '',
-        ', '.join(c.get('next_video_requests', [])) if isinstance(c.get('next_video_requests'), list) else '',
+        c.get('praise_points', ''),
+        c.get('complaints', ''),
+        c.get('next_video_requests', ''),
         c.get('new_viewer_signals', ''),
         c.get('fan_engagement', ''),
         c.get('viral_signals', ''),
@@ -294,7 +318,7 @@ def save_own_analysis(video: dict, gemini: dict, comments: dict) -> int:
             '신규시청자신호', '팬반응', '바이럴시그널', '재방문의사%', 'PPL반응', '크리에이터피드백',
             '댓글요약', 'URL',
         ],
-        [row], dedupe_col=2,
+        [row], dedupe_col=2, update_existing=has_text(g, "topic"),
     )
 
 
@@ -362,7 +386,7 @@ def save_strategy_scores(scores: list, videos_map: dict = None) -> int:
 
 
 def save_trend_classified(classified: dict) -> int:
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(config.KST).date().isoformat()
     rows = []
 
     def _to_row(v, track):

@@ -1,30 +1,62 @@
 """
 텔레그램 봇으로 알림 전송하는 모듈
 """
+import re
+import time
+from html import escape, unescape
+
 import requests
 import config
+from gemini_client import safe_error
 
 
 def send_message(text, parse_mode="HTML"):
-    """텔레그램 메시지 전송"""
+    """Bot API가 발송 ID를 반환한 경우만 성공으로 기록한다."""
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        print("⚠️ 텔레그램 설정 누락")
+        return False
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    
-    # 텔레그램 메시지 한도: 4096자
+
     if len(text) > 4000:
+        if parse_mode == "HTML":
+            text = unescape(re.sub(r"</?b>", "", text))
+            parse_mode = None
         text = text[:4000] + "...\n(내용이 길어 일부 생략됨)"
-    
+
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True
+        "link_preview_options": {"is_disabled": True},
     }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"텔레그램 전송 실패: {e}")
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    for attempt in range(2):
+        try:
+            response = requests.post(url, json=payload, timeout=30)
+            body = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            print(f"⚠️ 텔레그램 발송 확인 실패: {safe_error(exc)}")
+            return False
+        if not isinstance(body, dict):
+            print(f"⚠️ 텔레그램 응답 형식 오류 (HTTP {response.status_code})")
+            return False
+        result = body.get("result")
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if response.ok and body.get("ok") is True and isinstance(message_id, int):
+            print(f"  📨 텔레그램 발송 확인 (message_id={message_id})")
+            return True
+        description = str(body.get("description") or "응답에 발송 ID 누락")
+        if attempt == 0 and response.status_code == 429:
+            delay = (body.get("parameters") or {}).get("retry_after")
+            if isinstance(delay, int) and 0 <= delay <= 30:
+                time.sleep(delay)
+                continue
+        if (attempt == 0 and response.status_code == 400 and parse_mode == "HTML"
+                and "can't parse entities" in description.lower()):
+            payload.pop("parse_mode")
+            payload["text"] = unescape(re.sub(r"</?b>", "", text))
+            continue
+        print(f"⚠️ 텔레그램 발송 실패 (HTTP {response.status_code}): {safe_error(description)}")
         return False
 
 
@@ -66,8 +98,7 @@ def send_daily_trend_alert(trend_summary):
 def send_ad_boost_summary(summary: list):
     """채널별 광고 부스팅 의심 현황 알림"""
     if not summary:
-        send_message("📢 광고 분석: 데이터 없음")
-        return
+        return send_message("📢 광고 분석: 데이터 없음")
 
     msg = "📢 <b>채널별 광고 부스팅 의심 현황</b>\n━━━━━━━━━━━━━━━━━━\n\n"
     for s in summary:
@@ -79,25 +110,25 @@ def send_ad_boost_summary(summary: list):
             f"({rate}%) | 평균 점수 {s.get('avg_ad_score', 0)}\n"
         )
     msg += "\n🟢 20% 미만: 유기 성장  🟡 20~50%: 부분 광고  🔴 50%+: 광고 의존"
-    send_message(msg)
+    return send_message(msg)
 
 
-def send_weekly_report_alert(report, top_priority=None, market_state=None):
+def send_weekly_report_alert(report, top_priority=None, market_state=None, market_missing=False):
     """주간 리포트 알림 (매주 월요일 오전 10시)"""
     if 'error' in report:
         return send_message(f"⚠️ 주간 리포트 생성 실패: {report['error']}")
     
     insights = report.get('actionable_insights_for_hangoeun', [])
-    insights_text = "\n".join([f"  ▸ {ins}" for ins in insights[:5]])
+    insights_text = "\n".join(f"  ▸ {escape(str(ins))}" for ins in insights[:5])
     
     suggestions = report.get('next_video_suggestions', [])
-    suggestions_text = "\n".join([f"  ▸ {s}" for s in suggestions[:3]])
+    suggestions_text = "\n".join(f"  ▸ {escape(str(s))}" for s in suggestions[:3])
     
     rising = report.get('rising_topics', [])
-    rising_text = ", ".join(rising[:5]) if isinstance(rising, list) else str(rising)
+    rising_text = ", ".join(map(str, rising[:5])) if isinstance(rising, list) else str(rising)
     
     top_channels = report.get('top_performing_channels', [])
-    top_channels_text = "\n".join([f"  • {c}" for c in top_channels[:3]]) if isinstance(top_channels, list) else str(top_channels)
+    top_channels_text = "\n".join(f"  • {c}" for c in top_channels[:3]) if isinstance(top_channels, list) else str(top_channels)
     
     top5_text = ""
     if top_priority:
@@ -108,26 +139,26 @@ def send_weekly_report_alert(report, top_priority=None, market_state=None):
             score = v.get('priority_score', 0)
             action = v.get('recommended_action', '')
             reason = v.get('strategy_reason', '')[:80]
-            top5_text += f"  {i}. [{channel}] {title} — {score}점 | {action}\n"
+            top5_text += f"  {i}. [{escape(channel)}] {escape(title)} — {score}점 | {escape(action)}\n"
             if reason:
-                top5_text += f"     → {reason}\n"
+                top5_text += f"     → {escape(reason)}\n"
 
     # 시장 변화 분석 섹션
-    market_section = ""
+    market_section = "\n\n⚠️ 시장 변화 분석 미완료" if market_missing else ""
     if market_state and 'error' not in market_state:
         dominant = market_state.get('dominant_emotion', '')
         gap = market_state.get('competitive_gap', [])
         opportunity = market_state.get('hangoeun_opportunity_score', 0)
         recommended = market_state.get('hangoeun_recommended_topics', [])
         fatigue = market_state.get('viewer_fatigue_signals', [])
-        rec_text = "\n".join([f"  ▸ {t}" for t in recommended[:3]])
-        gap_text = "\n".join([f"  ▸ {g}" for g in gap[:2]])
-        fatigue_text = ", ".join(fatigue[:2]) if fatigue else "없음"
+        rec_text = "\n".join(f"  ▸ {escape(str(t))}" for t in recommended[:3])
+        gap_text = "\n".join(f"  ▸ {escape(str(g))}" for g in gap[:2])
+        fatigue_text = ", ".join(map(str, fatigue[:2])) if fatigue else "없음"
         market_section = f"""
 
 🧠 <b>시장 변화 분석</b>
-이번 주 감정: <b>{dominant}</b> | 기회점수: <b>{opportunity}점</b>
-시청자 피로: {fatigue_text}
+이번 주 감정: <b>{escape(str(dominant))}</b> | 기회점수: <b>{escape(str(opportunity))}점</b>
+시청자 피로: {escape(fatigue_text)}
 
 🎯 <b>한고은 기회 주제 (30일 후 업로드 기준)</b>
 {rec_text}
@@ -141,19 +172,19 @@ def send_weekly_report_alert(report, top_priority=None, market_state=None):
 ━━━━━━━━━━━━━━━━━━
 
 📝 <b>이번 주 요약</b>
-{report.get('week_summary', '')}
+{escape(report.get('week_summary', ''))}
 
 🏆 <b>잘 나가는 채널</b>
-{top_channels_text}
+{escape(top_channels_text)}
 
 🚀 <b>떠오르는 주제</b>
-{rising_text}
+{escape(rising_text)}
 
 🎬 <b>포맷 트렌드</b>
-{', '.join(report.get('format_trends', [])[:3]) if isinstance(report.get('format_trends'), list) else ''}
+{escape(', '.join(map(str, report.get('format_trends', [])[:3]))) if isinstance(report.get('format_trends'), list) else ''}
 
 💼 <b>PPL 관찰</b>
-{report.get('ppl_observations', '')}
+{escape(str(report.get('ppl_observations', '')))}
 
 ✨ <b>한고은 채널 액션 아이템</b>
 {insights_text}
@@ -188,10 +219,10 @@ def send_error_alert(error_msg, context=""):
 🚨 <b>시스템 오류 발생</b>
 ━━━━━━━━━━━━━━━━━━
 
-위치: {context}
-오류: {error_msg[:500]}
+위치: {escape(str(context))}
+오류: {escape(safe_error(error_msg))}
 
-GitHub Actions 로그를 확인해주세요.
+실행 로그를 확인해주세요.
 """
     return send_message(message.strip())
 
@@ -203,8 +234,8 @@ def send_irregular_alert(video: dict):
  
     msg = (
         f"⚡ <b>이레귤러 감지!</b>\n\n"
-        f"📺 <b>{video.get('title', '')}</b>\n"
-        f"📻 채널: {video.get('channel_title', '')}\n\n"
+        f"📺 <b>{escape(video.get('title', ''))}</b>\n"
+        f"📻 채널: {escape(video.get('channel_title', ''))}\n\n"
         f"📊 <b>지표</b>\n"
     )
  
@@ -223,10 +254,10 @@ def send_irregular_alert(video: dict):
  
     msg += f"\n🔗 https://www.youtube.com/watch?v={video.get('video_id', '')}"
  
-    send_message(msg)
+    return send_message(msg)
  
  
-def send_own_channel_alert(video: dict, gemini: dict, comments: dict):
+def send_own_channel_alert(video: dict, gemini: dict, comments: dict) -> bool:
     """자체 채널 새 영상 분석 알림"""
     g = gemini or {}
     c = comments or {}
@@ -235,34 +266,34 @@ def send_own_channel_alert(video: dict, gemini: dict, comments: dict):
 
     msg = (
         f"{emoji} <b>[자체채널 {vtype}] 새 영상 분석</b>\n\n"
-        f"📌 <b>{video.get('title', '')}</b>\n"
-        f"📅 업로드: {str(video.get('published_at', ''))[:10]}\n"
+        f"📌 <b>{escape(str(video.get('title', '')))}</b>\n"
+        f"📅 업로드: {escape(str(video.get('published_at', ''))[:10])}\n"
         f"👁 초기 조회수: {video.get('view_count', 0):,}회\n\n"
         f"🎯 <b>콘텐츠 분석</b>\n"
-        f"  주제: {g.get('topic', '')}\n"
-        f"  구조: {g.get('content_structure', '')}\n"
-        f"  성과 예측: {g.get('predicted_performance', '')} — {g.get('predicted_performance_reason', '')[:80]}\n"
-        f"  강점: {g.get('strengths', '')[:120]}\n"
-        f"  개선: {g.get('improvement_points', '')[:120]}\n"
+        f"  주제: {escape(g.get('topic', ''))}\n"
+        f"  구조: {escape(g.get('content_structure', ''))}\n"
+        f"  성과 예측: {escape(g.get('predicted_performance', ''))} — {escape(g.get('predicted_performance_reason', '')[:80])}\n"
+        f"  강점: {escape(g.get('strengths', '')[:120])}\n"
+        f"  개선: {escape(g.get('improvement_points', '')[:120])}\n"
     )
 
     if g.get('thumbnail_suggestion') and g.get('thumbnail_suggestion') != '없음':
-        msg += f"  썸네일: {g.get('thumbnail_suggestion', '')[:80]}\n"
+        msg += f"  썸네일: {escape(g.get('thumbnail_suggestion', '')[:80])}\n"
 
     if c and 'summary' in c:
         msg += (
             f"\n💬 <b>댓글 여론</b>\n"
-            f"  {c.get('summary', '')}\n"
-            f"  피드백: {c.get('creator_feedback', '')[:150]}\n"
+            f"  {escape(c.get('summary', ''))}\n"
+            f"  피드백: {escape(str(c.get('creator_feedback') or '')[:150])}\n"
         )
-        reqs = c.get('next_video_requests', [])
-        if reqs:
+        reqs = c.get('next_video_requests')
+        if isinstance(reqs, list) and reqs:
             msg += "\n📝 <b>다음 영상 요청</b>\n"
             for req in reqs[:3]:
-                msg += f"  • {req}\n"
+                msg += f"  • {escape(str(req))}\n"
 
-    msg += f"\n🔗 {video.get('video_url', '')}"
-    send_message(msg)
+    msg += f"\n🔗 {escape(str(video.get('video_url', '')))}"
+    return send_message(msg)
 
 
 def send_own_tracking_summary(results: list):
@@ -298,7 +329,7 @@ def send_weekly_trend_alert(weekly_data: dict):
     # 사건 키워드
     if event_kws:
         msg += "🔑 <b>이번 주 핵심 키워드</b>\n"
-        msg += " ".join([f"#{k}" for k in event_kws[:8]])
+        msg += " ".join(f"#{escape(k)}" for k in event_kws[:8])
         msg += "\n\n"
  
     # 트랙 A
@@ -307,7 +338,7 @@ def send_weekly_trend_alert(weekly_data: dict):
         for i, v in enumerate(track_a[:5], 1):
             title = v.get('title', '')[:35]
             views = v.get('view_count', 0)
-            msg += f"  {i}. [{v.get('channel_title','')}] {title}\n"
+            msg += f"  {i}. [{escape(v.get('channel_title',''))}] {escape(title)}\n"
             msg += f"     조회수 {views:,}회\n"
     else:
         msg += "  (해당 영상 없음)\n"
@@ -319,9 +350,9 @@ def send_weekly_trend_alert(weekly_data: dict):
         for i, v in enumerate(track_b[:5], 1):
             title = v.get('title', '')[:35]
             views = v.get('view_count', 0)
-            msg += f"  {i}. [{v.get('channel_title','')}] {title}\n"
+            msg += f"  {i}. [{escape(v.get('channel_title',''))}] {escape(title)}\n"
             msg += f"     조회수 {views:,}회\n"
     else:
         msg += "  (해당 영상 없음)\n"
  
-    send_message(msg)
+    return send_message(msg)
