@@ -197,6 +197,19 @@ class DailyPipelineTests(unittest.TestCase):
         self.db.save_weekly_report.assert_not_called()
         alert.assert_called_once_with("HTTP 402", "주간 리포트")
 
+    def test_score_and_save_forwards_thumbnail_analyses(self):
+        high_thumb = {"couple_present": True, "face_count": 2, "main_emotion": "놀람"}
+        analyses = [{"video_id": "recent", "gemini": {"topic": "valid", "content_structure": "토크형"}, "comments": {}}]
+        self.db.get_thumbnail_analyses.return_value = {}
+        self.assertEqual(main._score_and_save(analyses, [video("recent")], "daily_analysis"), 1)
+        no_thumb_score = self.db.save_video_scores.call_args.args[0][0]
+
+        self.db.get_thumbnail_analyses.return_value = {"recent": high_thumb}
+        self.assertEqual(main._score_and_save(analyses, [video("recent")], "daily_analysis"), 1)
+        self.db.get_thumbnail_analyses.assert_called_with(["recent"])
+        with_thumb_score = self.db.save_video_scores.call_args.args[0][0]
+        self.assertGreater(with_thumb_score["novelty_score"], no_thumb_score["novelty_score"])
+
 
 class OwnChannelTests(unittest.TestCase):
     def setUp(self):
@@ -473,6 +486,22 @@ class PaginationTests(unittest.TestCase):
             pending = supabase_writer.get_videos_needing_comment_reanalysis(limit=1)
         self.assertEqual(pending, [{"video_id": "500", "title": "", "comment_count": 0}])
         self.assertEqual([offset for _, offset, _ in requests], [0, 500])
+
+    def test_get_thumbnail_analyses_paginates_all_and_filtered_batches(self):
+        rows = [{"video_id": f"v{i:04}", "couple_present": i % 2 == 0} for i in range(502)]
+        requests = []
+        with self.postgrest({"thumbnail_analysis": rows}, requests):
+            all_thumbs = supabase_writer.get_thumbnail_analyses()
+        self.assertEqual(len(all_thumbs), 502)
+        self.assertEqual([offset for _, offset, _ in requests], [0, 500])
+
+        filtered_requests = []
+        target_ids = [f"v{i:04}" for i in range(105)]
+        with self.postgrest({"thumbnail_analysis": rows[:50]}, filtered_requests):
+            subset = supabase_writer.get_thumbnail_analyses(["", "v0001", "v0001", *target_ids])
+        self.assertEqual(len(subset), 50)
+        self.assertEqual(len(filtered_requests), 2)
+        self.assertTrue(all(order == "video_id" for _, _, order in filtered_requests))
 
 
 class ProcessingKeyFallbackTests(unittest.TestCase):

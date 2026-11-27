@@ -29,6 +29,7 @@ _SCORE_WEIGHTS_BY_VERSION = {
         "risk_score": -0.15,
         "ppl_potential_score": 0.10,
         "trend_lifespan_score": 0.08,
+        "upload_delay_risk": -0.10,
         "evergreen_score": 0.15,
     },
     "v2.0": PRIORITY_WEIGHTS,
@@ -1252,7 +1253,10 @@ def main(argv=None) -> int:
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--lookback-days", type=int, default=210)
     parser.add_argument("--min-samples", type=int, default=7)
-    parser.add_argument("--score-version", help="백테스트 점수 버전 (예: v1.2, v2.0). 기본값은 config.SCORE_VERSION.")
+    parser.add_argument(
+        "--score-version", choices=sorted(_SCORE_WEIGHTS_BY_VERSION),
+        help="백테스트 점수 버전 (예: v1.2, v2.0). 기본값은 config.SCORE_VERSION.",
+    )
     parser.add_argument("--skip-btrack", action="store_true")
     args = parser.parse_args(argv)
     if args.lookback_days < 1 or args.min_samples < 1:

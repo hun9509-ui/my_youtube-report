@@ -359,6 +359,26 @@ class RepairTest(unittest.TestCase):
         self.assertEqual(report["steps"]["scores-recompute"]["orphans_deleted"], 1)
         self.assertEqual(client.writes[-1][:3], ("video_scores", "delete", {"id": [2]}))
 
+    def test_scores_recompute_passes_thumbnail_analysis_to_scorer(self):
+        base_gemini = {"topic": "토크 주제", "content_structure": "토크형", "applicability": "상"}
+        client = FakeClient(
+            initial_analysis=[
+                analysis(1, "high_thumb", "토크 주제", gemini_raw=base_gemini),
+                analysis(2, "low_thumb", "토크 주제", gemini_raw=base_gemini),
+            ],
+            videos=[video("high_thumb"), video("low_thumb")],
+            thumbnail_analysis=[
+                {"video_id": "high_thumb", "couple_present": True, "face_count": 2, "main_emotion": "놀람"},
+                {"video_id": "low_thumb", "face_count": 1, "food_present": True},
+            ],
+        )
+        status, report = self.run_cli(client, "scores-recompute", "--apply")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["steps"]["scores-recompute"]["saved"], 2)
+        by_video = {row["video_id"]: row for row in client.rows["video_scores"]}
+        self.assertGreater(by_video["high_thumb"]["novelty_score"], by_video["low_thumb"]["novelty_score"])
+        self.assertGreater(by_video["high_thumb"]["priority_score"], by_video["low_thumb"]["priority_score"])
+
     def test_own_reanalysis_keeps_original_comments_and_queries_video_id(self):
         raw = {"summary": "keep", "_version": "older", "extension": {"foo": 1}}
         failed = {"video_id": "own", "topic": "", "gemini_raw": {"error": "retry"}, "deepseek_raw": raw}

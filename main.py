@@ -170,7 +170,10 @@ def _score_and_save(analyses: list[dict], videos_list: list[dict], source_table:
     try:
         videos_map = {v.get('video_id'): v for v in videos_list}
         valid = [a for a in analyses if has_text(a.get("gemini"), "topic")]
-        scores = scorer.score_batch(videos_map, valid, source_table)
+        video_ids = [a.get("video_id") for a in valid if a.get("video_id")]
+        thumbs = db.get_thumbnail_analyses(video_ids) if video_ids else {}
+        thumbnails_map = thumbs if isinstance(thumbs, dict) else {}
+        scores = scorer.score_batch(videos_map, valid, source_table, thumbnails_map=thumbnails_map)
         if not scores:
             return 0
         saved = db.save_video_scores(scores)
@@ -192,7 +195,7 @@ def run_initial_batch(batch_num: int):
     start = time.time()
 
     if batch_num not in config.INITIAL_BATCHES:
-        print(f"❌ 잘못된 배치 번호: {batch_num} (1~5)")
+        print(f"❌ 잘못된 배치 번호: {batch_num} (1~{max(config.INITIAL_BATCHES)})")
         return
 
     channels = config.INITIAL_BATCHES[batch_num]
@@ -704,10 +707,21 @@ def run_score_backfill():
 
     all_scores = []
     all_videos_map = {}
+    target_ids = [
+        video.get('video_id') or analysis.get('video_id')
+        for video, analysis in (*initial_rows, *daily_rows)
+        if video.get('video_id') or analysis.get('video_id')
+    ]
+    thumbs = db.get_thumbnail_analyses(target_ids) if target_ids else {}
+    thumbnails_map = thumbs if isinstance(thumbs, dict) else {}
 
     for video, analysis in initial_rows:
         try:
-            score = scorer.score_video(video, analysis, 'initial_analysis')
+            vid = video.get('video_id') or analysis.get('video_id')
+            score = scorer.score_video(
+                video, analysis, 'initial_analysis',
+                thumbnail=thumbnails_map.get(vid),
+            )
             all_scores.append(score)
             if video.get('video_id'):
                 all_videos_map[video['video_id']] = video
@@ -716,7 +730,11 @@ def run_score_backfill():
 
     for video, analysis in daily_rows:
         try:
-            score = scorer.score_video(video, analysis, 'daily_analysis')
+            vid = video.get('video_id') or analysis.get('video_id')
+            score = scorer.score_video(
+                video, analysis, 'daily_analysis',
+                thumbnail=thumbnails_map.get(vid),
+            )
             all_scores.append(score)
             if video.get('video_id'):
                 all_videos_map[video['video_id']] = video

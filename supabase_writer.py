@@ -992,6 +992,41 @@ def save_thumbnail_analysis(video_id: str, analysis: dict) -> bool:
         return False
 
 
+def get_thumbnail_analyses(video_ids=None) -> dict:
+    """영상별 thumbnail_analysis 요약 필드 조회 ({video_id: row})"""
+    client = get_client()
+    if not client:
+        return {}
+    columns = "video_id,couple_present,face_count,main_emotion,luxury_signal,home_visible,food_present"
+    try:
+        if video_ids is None:
+            rows = _read_pages(
+                lambda: client.table('thumbnail_analysis').select(columns).order('video_id')
+            )
+            return {row['video_id']: row for row in rows if row.get('video_id')}
+
+        unique_ids = list(dict.fromkeys(vid for vid in video_ids if vid))
+        if not unique_ids:
+            return {}
+        thumbnails = {}
+        for start in range(0, len(unique_ids), 100):
+            batch = unique_ids[start:start + 100]
+            rows = _read_pages(
+                lambda b=batch: client.table('thumbnail_analysis')
+                .select(columns)
+                .in_('video_id', b)
+                .order('video_id')
+            )
+            for row in rows:
+                vid = row.get('video_id')
+                if vid:
+                    thumbnails[vid] = row
+        return thumbnails
+    except Exception as e:
+        print(f"  ⚠️ thumbnail_analysis 조회 실패: {safe_error(e)}")
+        return {}
+
+
 def get_videos_for_thumbnail_analysis(mode: str = 'full_initial', limit: int = 500) -> list:
     """
     썸네일 분석 대상 영상 조회 (미분석만)
