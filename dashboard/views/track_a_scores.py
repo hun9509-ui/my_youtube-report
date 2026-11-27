@@ -15,7 +15,7 @@ from components.ui import (
 from lib.constants import ACTION_META, ACTION_ORDER, COMPARE_SCORE_VERSIONS, DEFAULT_SCORE_VERSION, SUBSCORES
 from lib.queries import get_score_versions, get_strategy_scores
 from lib.supabase_client import get_client
-from lib.transforms import fmt_date, fmt_int, parse_rule_trace, video_id_link
+from lib.transforms import ensure_columns, fmt_date, fmt_int, parse_rule_trace, video_id_link
 
 client = get_client()
 available = get_score_versions(client)
@@ -39,8 +39,11 @@ scores = get_strategy_scores(client, version)
 if scores.empty:
     empty_state(f"{version} 점수 데이터가 없습니다.", "strategy_scorer 파이프라인 실행 후 다시 확인하세요.")
     st.stop()
+scores = ensure_columns(
+    scores, ["video_id", "title", "channel_title", "view_count", "published_at", "video_url", "scored_at", "recommended_action"],
+)
 
-channels = sorted(scores["channel_title"].dropna().unique().tolist()) if "channel_title" in scores else []
+channels = sorted(scores["channel_title"].dropna().unique().tolist())
 with c2:
     picked = st.multiselect("경쟁 채널", channels, placeholder=f"전체 {len(channels)}개 채널", key="a1_channels")
 with c3:
@@ -74,7 +77,13 @@ kpi_strip([
 ])
 
 with st.expander("채널별 실행 등급 분포", icon=":material/stacked_bar_chart:"):
-    dist = df.groupby(["channel_title", "recommended_action"]).size().reset_index(name="n") if len(df) else pd.DataFrame()
+    dist = (
+        df.assign(channel_title=df["channel_title"].fillna("채널 미상"))
+        .groupby(["channel_title", "recommended_action"])
+        .size()
+        .reset_index(name="n")
+        if len(df) else pd.DataFrame()
+    )
     stacked_bar(dist, x="n", y="channel_title", color="recommended_action",
                 color_domain=list(ACTION_ORDER), color_range=["#3F8A5C", "#5868A8", "#B9861D", "#CFCABD"],
                 x_title="후보 수")

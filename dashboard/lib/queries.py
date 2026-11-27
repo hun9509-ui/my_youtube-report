@@ -438,27 +438,31 @@ def get_b_track_entity_scores(_client, scored_at: str | None = None) -> pd.DataF
 
 
 _COLS_B_TRACK_ANSWER_CARDS = (
-    "entity_id,entity_name,card_date,question_type,answer_summary,evidence_bullets,"
+    "id,entity_id,entity_name,card_date,question_type,answer_summary,evidence_bullets,"
     "caution_bullets,recommended_content_ideas,best_examples,confidence"
 )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_b_track_answer_cards(_client, card_date: str | None = None) -> pd.DataFrame:
-    """trend_answer_cards 최신 card_date 단일 스냅샷."""
+    """trend_answer_cards 최신 card_date 단일 스냅샷 (엔티티당 entity_reaction 우선 1건)."""
     snapshot = card_date or _latest_value(_client, "trend_answer_cards", "card_date")
     if not snapshot:
         return pd.DataFrame()
     rows = _safe(lambda: _read_pages(
         lambda: _client.table("trend_answer_cards")
         .select(_COLS_B_TRACK_ANSWER_CARDS)
-        .eq("card_date", snapshot).order("entity_id")
+        .eq("card_date", snapshot)
+        .order("entity_id").order("question_type").order("id", desc=True)
     ), [])
     df = _frame(rows, _COLS_B_TRACK_ANSWER_CARDS)
     if df.empty:
         return df
-    df = df[df["card_date"].astype(str) == str(snapshot)]
-    return latest_per_key(df, key="entity_id", order="card_date")
+    df = df[df["card_date"].astype(str) == str(snapshot)].copy()
+    df["_qt_rank"] = df["question_type"].map(lambda q: 0 if q == "entity_reaction" else 1)
+    df = df.sort_values(["entity_id", "_qt_rank", "question_type", "id"],
+                        ascending=[True, True, True, False], na_position="last")
+    return df.drop_duplicates(subset=["entity_id"], keep="first").drop(columns=["_qt_rank"]).reset_index(drop=True)
 
 
 _COLS_B_TRACK_CLUSTERS = (

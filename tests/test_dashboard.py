@@ -22,8 +22,11 @@ import logging  # noqa: E402
 
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
-import pandas as pd  # noqa: E402
-import streamlit as st  # noqa: E402
+try:
+    import pandas as pd  # noqa: E402
+    import streamlit as st  # noqa: E402
+except ModuleNotFoundError as exc:
+    raise unittest.SkipTest(f"대시보드 선택 의존성 미설치: {exc}")
 
 from lib import constants, queries, transforms  # noqa: E402
 from lib.constants import OWN_CHANNEL  # noqa: E402
@@ -572,6 +575,48 @@ class AppSmokeTest(DashboardTestCase):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("supabase.co", text)
             self.assertNotIn("eyJhbGci", text)
+
+
+class CodexRegressionTest(DashboardTestCase):
+    def test_answer_cards_prefers_entity_reaction_deterministically(self):
+        cards = [
+            {"id": 10, "entity_id": 1, "entity_name": "로퍼", "card_date": _date(0),
+             "question_type": "alpha_other", "answer_summary": "alpha"},
+            {"id": 5, "entity_id": 1, "entity_name": "로퍼", "card_date": _date(0),
+             "question_type": "entity_reaction", "answer_summary": "reaction"},
+            {"id": 20, "entity_id": 1, "entity_name": "로퍼", "card_date": _date(0),
+             "question_type": "zeta_other", "answer_summary": "zeta"},
+        ]
+        client = FakeClient({"trend_answer_cards": cards})
+        df = queries.get_b_track_answer_cards(client)
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.loc[0, "question_type"], "entity_reaction")
+        self.assertEqual(df.loc[0, "answer_summary"], "reaction")
+
+    def test_normalize_text_and_celeb_unadopted_handle_na(self):
+        self.assertEqual(transforms.normalize_text(None), "")
+        self.assertEqual(transforms.normalize_text(float("nan")), "")
+        self.assertEqual(transforms.normalize_text(pd.NA), "")
+        ents = pd.DataFrame([
+            {"entity_id": 1, "entity_name": float("nan"), "trend_stage": "rising", "distinct_channels_30d": 5},
+            {"entity_id": 2, "entity_name": pd.NA, "trend_stage": "rising", "distinct_channels_30d": 5},
+            {"entity_id": 3, "entity_name": "발레코어", "trend_stage": "rising", "distinct_channels_30d": 5},
+        ])
+        out = transforms.celeb_unadopted(ents, [None, float("nan"), pd.NA, "이민정 토크"], min_channels=3)
+        self.assertEqual(out["entity_name"].tolist(), ["발레코어"])
+
+    def test_track_a_scores_renders_when_videos_table_fails(self):
+        try:
+            from streamlit.testing.v1 import AppTest
+        except ImportError:  # pragma: no cover
+            self.skipTest("streamlit.testing 사용 불가")
+        env = {"SUPABASE_URL": "https://example.invalid", "SUPABASE_KEY": "test-key"}
+        client = FakeClient(sample_tables(), fail_tables={"videos"})
+        with mock.patch.dict(os.environ, env), \
+                mock.patch("lib.supabase_client.get_client", return_value=client):
+            at = AppTest.from_file(str(DASHBOARD / "app.py"), default_timeout=60)
+            at.switch_page("views/track_a_scores.py").run()
+            self.assertFalse(at.exception, f"track_a_scores: {[e.value for e in at.exception]}")
 
 
 if __name__ == "__main__":

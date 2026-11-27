@@ -422,7 +422,14 @@ _NORMALIZE_RE = re.compile(r"[\s\-_·•.,!?'\"()\[\]#/]+")
 
 
 def normalize_text(text) -> str:
-    return _NORMALIZE_RE.sub("", str(text or "").lower())
+    if text is None:
+        return ""
+    try:
+        if pd.isna(text):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return _NORMALIZE_RE.sub("", str(text).lower())
 
 
 def celeb_unadopted(entities: pd.DataFrame, celeb_titles: Iterable[str], *,
@@ -443,7 +450,7 @@ def celeb_unadopted(entities: pd.DataFrame, celeb_titles: Iterable[str], *,
     df = df[df["distinct_channels_30d"] >= min_channels]
     if df.empty:
         return pd.DataFrame(columns=cols)
-    corpus = " ".join(normalize_text(t) for t in (celeb_titles or []) if t)
+    corpus = " ".join(norm for t in (celeb_titles or []) if (norm := normalize_text(t)))
     keys = df["entity_name"].map(normalize_text)
     keep = keys.map(lambda k: len(k) >= min_name_len and k not in corpus)
     out = df[keep].sort_values(
